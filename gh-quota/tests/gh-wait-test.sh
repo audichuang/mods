@@ -93,8 +93,8 @@ check "pr: failure names the check" 1 stdout-has=fail:lint
 fresh
 resp 1 '200 OK' "$RUN_WAIT" 'Etag: W/"abc"'
 resp 2 '304 Not Modified' ''
-GH_WAIT_BEAT=1 gw 20 run 7 -R o/r -i 1 -t 1
-check "timeout: -t 1 (GH_WAIT_MINUTE=2), heartbeat" 2 'stderr-has=timeout after 1 min, last state: wait:in_progress' \
+GH_WAIT_BEAT=1 GH_WAIT_MINUTE=5 gw 20 run 7 -R o/r -i 1 -t 1
+check "timeout: -t 1 (GH_WAIT_MINUTE=5), heartbeat" 2 'stderr-has=timeout after 1 min, last state: wait:in_progress' \
     'stdout-has=unchanged for'
 
 fresh
