@@ -1,0 +1,1 @@
+{ "name": "zh-steady", "version": "0.1.0", "description": "Nudges the model back to Traditional Chinese right after a step drifts into English, before it snowballs." }

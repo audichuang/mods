@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Wait for a GitHub Actions run or a PR's checks without burning the REST quota.
+# Uses ETag conditional requests: a 304 (nothing changed) does not count against
+# the 5000/hr limit, so only actual state changes cost a request.
+#
+#   gh-wait run <run-id> [-R owner/repo] [-i seconds] [-t timeout-minutes]
+#   gh-wait pr  <number> [-R owner/repo] [-i seconds] [-t timeout-minutes]
+#
+# Exit: 0 success, 1 finished but failed, 2 usage/API error or timeout (default 120 min).
+set -uo pipefail
+
+usage() { sed -n 's/^#   //p' "$0" >&2; exit 2; }
+[ $# -ge 2 ] || usage
+kind=$1 target=$2; shift 2
+repo='' interval=15 timeout=120
+while [ $# -gt 0 ]; do
+    [ $# -ge 2 ] || usage
+    case $1 in
+        -R|--repo) repo=$2; shift 2 ;;
+        -i|--interval) interval=$2; shift 2 ;;
+        -t|--timeout) timeout=$2; shift 2 ;;
+        *) usage ;;
+    esac
+done
+[[ $interval =~ ^[1-9][0-9]*$ && $timeout =~ ^[1-9][0-9]*$ ]] || usage
+[ -n "$repo" ] || repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
+
+case $kind in
+    run)
+        path="repos/$repo/actions/runs/$target"
+        # done: completed; ok: conclusion is success
+        jq_state='if .status == "completed" then (if .conclusion == "success" then "ok" else "fail:" + .conclusion end) else "wait:" + .status end'
+        ;;
+    pr)
+        sha=$(gh api "repos/$repo/pulls/$target" -q .head.sha) || exit 2
+        path="repos/$repo/commits/$sha/check-runs?per_page=100"
+        jq_state='.check_runs as $c
+            | if ($c | length) == 0 then "wait:no checks yet"
+              elif any($c[]; .status != "completed") then "wait:\([$c[] | select(.status != "completed")] | length) running (\([$c[] | select(.status != "completed") | .name] | join(", ")))"
+              elif all($c[]; .conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") then "ok"
+              else "fail:" + ([$c[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") | .name] | join(", ")) end'
+        ;;
+    *) usage ;;
+esac
+
+etag='' last='' errors=0 changed=$SECONDS beat=$SECONDS
+deadline=$((SECONDS + timeout * 60))
+while :; do
+    if [ $SECONDS -ge $deadline ]; then
+        echo "$(date +%H:%M:%S) timeout after ${timeout} min, last state: ${last:-unknown}" >&2
+        exit 2
+    fi
+    resp=$(gh api -i ${etag:+-H "If-None-Match: $etag"} "$path" 2>/dev/null)
+    code=$(head -1 <<<"$resp" | awk '{print $2}')
+    case $code in
+        304) errors=0 ;;
+        401|404|422)
+            echo "$(date +%H:%M:%S) HTTP $code for $path" >&2
+            exit 2
+            ;;
+        200)
+            errors=0
+            etag=$(sed -n 's/^[Ee][Tt]ag: *//p' <<<"$resp" | tr -d '\r' | head -1)
+            state=$(awk 'f; /^\r?$/ {f=1}' <<<"$resp" | jq -r "$jq_state") || exit 2
+            if [ "$state" != "$last" ]; then
+                echo "$(date +%H:%M:%S) $state"
+                changed=$SECONDS beat=$SECONDS
+            fi
+            last=$state
+            case $state in
+                ok) exit 0 ;;
+                fail:*)
+                    if [ "$kind" = run ]; then
+                        gh api "$path/jobs?per_page=100" -q '[.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "\(.name) (\(.conclusion))"] | "failed jobs: " + join(", ")' 2>/dev/null
+                    fi
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            errors=$((errors + 1))
+            echo "$(date +%H:%M:%S) HTTP ${code:-?} (attempt $errors)" >&2
+            [ $errors -ge 5 ] && exit 2
+            sleep $((interval * errors))
+            continue
+            ;;
+    esac
+    # State unchanged (304, or 200 with the same state). Say so every 5 min, so a stuck check is visible.
+    if [ $((SECONDS - beat)) -ge "${GH_WAIT_BEAT:-300}" ]; then
+        echo "$(date +%H:%M:%S) unchanged for $(((SECONDS - changed) / 60)) min: $last"
+        beat=$SECONDS
+    fi
+    sleep "$interval"
+done

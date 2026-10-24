@@ -1,0 +1,6 @@
+*.log
+*-out.txt
+.DS_Store
+hello-above-prompt/
+.claude-plugin/types/
+*/.claude-plugin/types/
