@@ -150,7 +150,32 @@ DENY:變數|while true; do gh run view 1; sleep $N; done
 DENY:變數|for i in 1 2 3; do gh api x; sleep $((i * 30)); done
 DENY:sleep 5 秒|while true; do gh api x; sleep "5"; done
 allow|while true; do gh api x; sleep "120"; done
+DENY|ssh -o "StrictHostKeyChecking no" ubuntu gh run watch 1
+DENY|ssh -o 'StrictHostKeyChecking no' ubuntu gh run watch 1
+DENY|ssh -o "ProxyCommand=ssh -W %h:%p jump" ubuntu gh run watch 1
+DENY|ssh -o ProxyCommand="ssh -W %h:%p jump" ubuntu gh run watch 1
+DENY|ssh -o "StrictHostKeyChecking no" ubuntu 'while true; do gh api x; sleep 5; done'
+allow|ssh -o "StrictHostKeyChecking no" ubuntu gh run view 1
+allow|while read r; do gh repo view "$r"; done < repos.txt
+allow|gh issue list --json number -q ".[].number" | while read n; do gh issue view $n; done
+allow|while IFS= read -r r; do gh api "repos/$r"; done < repos.txt
+allow|while read l; do echo "gh is $l"; done < f
+allow|while true; do echo "gh is up"; sleep 5; done
+allow|git commit -m "guard: catch polling inside (bash -c 'while true; do gh api x; sleep 5; done') too"
+allow|echo "ssh ubuntu 'while true; do gh api x; sleep 5; done'"
+DENY:sleep 5 秒|while read r; do gh api "repos/$r"; sleep 5; done < repos.txt
+DENY:沒有 sleep|while true; do read x; gh api "$x"; done
+DENY|while true; do echo "$(gh run view 1 --json status)"; sleep 5; done
+DENY|while true; do ssh ubuntu "gh api x"; sleep 5; done
 CASES
+
+# Multi-line commands: backslash continuation keeps one curl; heredoc bodies are text, not commands.
+run "curl URL \\ newline -H Authorization \$(gh auth token)" allow 10 cmd $'curl -s https://api.github.com/repos/a/b \\\n  -H "Authorization: Bearer $(gh auth token)"'
+run "curl URL \\ newline -H Authorization \$GH_TOKEN" allow 10 cmd $'curl -s https://api.github.com/repos/a/b \\\n  -H "Authorization: token $GH_TOKEN"'
+run "curl URL \\ newline -o (no token)" DENY 10 cmd $'curl -s https://api.github.com/repos/a/b \\\n  -o out.json'
+run "curl URL newline echo \$GH_TOKEN (no continuation)" DENY 10 cmd $'curl -s https://api.github.com/repos/a/b\necho $GH_TOKEN'
+run "git commit -F - heredoc quoting bash -c polling" allow 10 cmd $'git commit -F - <<\'EOF\'\nguard: catch polling inside (bash -c \'while true; do gh api x; sleep 5; done\') too\nEOF'
+run "bash heredoc script polling gh" DENY 10 cmd $'bash <<\'EOF\'\nwhile true; do gh api x; sleep 5; done\nEOF'
 
 # Malformed input: the hook must exit 0 with no output, never crash.
 for raw in '' 'notjson' '[]' '{}' '"x"' '{"tool_input":"x"}' '{"tool_input":{"command":5}}' '{"tool_input":null}'; do
@@ -158,15 +183,19 @@ for raw in '' 'notjson' '[]' '{}' '"x"' '{"tool_input":"x"}' '{"tool_input":{"co
 done
 
 # Catastrophic backtracking: prose that repeats wrapper words must finish fast (the engine kills the hook at 10 s).
-p1='' p2='' p3='' p4=''
+p1='' p2='' p3='' p4='' p5='' p6=''
 for i in $(seq 40); do
     p1="$p1 ssh host$i gh uptime,"; p2="$p2 ssh"; p3="$p3 env -u"; p4="$p4 stdbuf -o"
+    p5="$p5 ssh -o \"a b\""; p6="$p6 ssh -o 'x"
 done
 run "echo \"ssh hostN gh uptime, ...\" x40" allow 2 cmd "echo \"$p1 gh\""
 run "bare ssh x40" allow 2 cmd "$p2 gh"
 run "env -u x40" allow 2 cmd "$p3 gh"
 run "stdbuf -o x40" allow 2 cmd "$p4 gh"
 run "for loop over ssh x40 prose" allow 2 cmd "for l in a; do echo \"$p1\"; done"
+run "ssh -o \"a b\" x40" allow 2 cmd "$p5 gh"
+run "ssh -o 'x (unbalanced) x40" allow 2 cmd "$p6 gh"
+run "while read over ssh -o \"a b\" x40 prose" allow 2 cmd "while read l; do echo '$p5'; done < f"
 
 # Logging: one JSON line per deny with the documented keys; rotate to hook.log.1 past 1 MB.
 log="$tmp/state/hook.log"
