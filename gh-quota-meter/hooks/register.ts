@@ -3,6 +3,8 @@ import type { Register } from 'claude-code'
 // The rate_limit endpoint itself does not count against the quota.
 const EVERY_MS = 120_000
 const WARN_BELOW = 1000
+// Without a usable token (an SSH session can't reach the macOS keychain) gh reports the anonymous 60.
+const ANON_LIMIT = 60
 const JQ = '[.resources.core.remaining, .resources.core.limit, .resources.core.reset, .resources.graphql.remaining] | @tsv'
 // $.process.run takes no shell, and the Claude process's PATH may lack Homebrew's bin.
 const GH = ['gh', '/opt/homebrew/bin/gh', '/home/linuxbrew/.linuxbrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'] as const
@@ -10,7 +12,7 @@ const GH = ['gh', '/opt/homebrew/bin/gh', '/home/linuxbrew/.linuxbrew/bin/gh', '
 const LOG_DIR = '.local/state/gh-quota'
 const LOG_MAX = 500
 
-type Kind = 'ok' | 'no-gh' | 'timeout' | 'fail' | 'bad-output'
+type Kind = 'ok' | 'anon' | 'no-gh' | 'timeout' | 'fail' | 'bad-output'
 
 export const register: Register = on => {
   let warnedForReset = 0
@@ -67,6 +69,10 @@ export const register: Register = on => {
         return { kind: 'bad-output', text: 'GH 額度：回應格式不對', detail: ran.stdout.trim().slice(0, 200) }
       }
       const resetAt = new Date(reset * 1000).toTimeString().slice(0, 5)
+      // The account's quota isn't this one, so say not logged in instead of warning about it.
+      if (limit <= ANON_LIMIT) {
+        return { kind: 'anon', text: `GH 未登入（匿名 ${remaining}/${limit}）· gh auth login`, detail: `${remaining}/${limit}` }
+      }
       if (remaining < WARN_BELOW && warnedForReset !== reset) {
         warnedForReset = reset
         $.ui.toast(`GitHub API 額度只剩 ${remaining}/${limit}，${resetAt} 重置。等 CI 用 gh-wait，別輪詢。`)

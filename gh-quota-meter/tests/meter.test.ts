@@ -38,7 +38,8 @@ function engine(on: any, out: { exitCode: number; stdout: string; stderr?: strin
 }
 
 async function settle(until: () => boolean) {
-  for (let i = 0; i < 200 && !until(); i++) await new Promise(r => setTimeout(r, 5))
+  // The environment has no timers; yielding lets the start-up refresh's $ calls run through.
+  for (let i = 0; i < 5000 && !until(); i++) await Promise.resolve()
 }
 
 test('interactive session: status shows the quota, log has start then ok', async ($, on) => {
@@ -58,6 +59,15 @@ test('low quota: one toast and a warn line', async ($, on) => {
   await settle(() => calls.toast.length > 0 && (files[FILE] ?? '').includes('\tok\t'))
   expect(calls.toast).toHaveLength(1)
   expect(files[FILE]).toContain('\twarn\t300/5000')
+})
+
+test('anonymous quota: says not logged in, no toast', async ($, on) => {
+  const { files, calls } = engine(on, { exitCode: 0, stdout: '55\t60\t1761300000\t0\n' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as any)
+  await settle(() => (files[FILE] ?? '').includes('\tanon\t'))
+  expect(calls.status.at(-1)).toBe('GH 未登入（匿名 55/60）· gh auth login')
+  expect(calls.toast).toEqual([])
+  expect((files[FILE] ?? '').trim().split('\n').map(l => l.split('\t')[1])).toEqual(['start', 'anon'])
 })
 
 test('timeout is told apart from a failed call', async ($, on) => {
