@@ -3,7 +3,7 @@
 import json, glob, os, re, sys, time
 home = os.path.expanduser('~'); cutoff = time.time() - 60*86400
 def lang(t):
-    t = re.sub(r"```.*?```|`[^`]*`|https?://\S+|\S*/\S+", "", t, flags=re.S)
+    t = re.sub(r"```.*?```|`[^`]*`|https?://[\x21-\x7e]+|(?<![\w.~-])[\w.~-]*/[\w.~/-]*", "", t, flags=re.S | re.A)
     lat = len(re.findall(r"[A-Za-z]", t)); cjk = len(re.findall(r"[一-鿿]", t))
     if lat + cjk < 40: return None
     return 'zh' if cjk / (lat/4 + cjk) > 0.3 else 'en'

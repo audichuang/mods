@@ -1,5 +1,5 @@
 // Run with: claude plugin test .
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import {
   advise,
   lifeColor,
@@ -21,9 +21,9 @@ import {
   countMisses,
   sessionHit,
   fitBand,
-} from '../hooks/cache.ts'
-import type { Policy, Sample } from '../hooks/cache.ts'
-import { deltaColor, parseRateLimit, shortAdvice, fmtPct, fmtShort, fmtUsd, gauge, heat, modelColor, turnSpend, heatGauge, HEAT, parseGitStatus, prettyModel, SCALE, shortPath, topTools, TRACK } from '../hooks/hud.ts'
+} from '../hooks/cache'
+import type { Policy, Sample } from '../hooks/cache'
+import { deltaColor, parseRateLimit, shortAdvice, fmtPct, fmtShort, fmtUsd, gauge, heat, modelColor, turnSpend, heatGauge, HEAT, parseGitStatus, prettyModel, SCALE, shortPath, topTools, TRACK } from '../hooks/hud'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -146,33 +146,77 @@ describe('per-turn rows', () => {
     ])
     expect(rows.length).toBe(2)
     expect(rows[0]).toEqual(expect.objectContaining({ turnId: 'a', steps: 2, read: 25, write: 5, fresh: 3 }))
-    expect(rows[1].steps).toBe(1)
+    expect(rows[1]?.steps).toBe(1)
   })
 })
 
 // The module end to end: a main-loop request feeds the band, a subagent's does not.
-type Calls = { status: (string | undefined)[]; logs: string[] }
+type Calls = { status: (string | undefined)[]; logs: string[]; toasts?: string[]; closed?: string[] }
 
 let ghRate = ''
+// how gh exits beside ghRate: 4 and 'gh auth login' when it was never logged in
+let ghExit = { exitCode: 0, stderr: '' }
+// the model the session reports; a test changes it to stand for a /model switch
+let modelId = 'claude-opus-5-5'
+// every command the module ran, and a hook that answers git status in its place (a slow repo)
+let argvs: string[][] = []
+let gitRun: (() => Promise<unknown>) | undefined
+// holds back the next session.usage answer, read when asked, until the promise settles: a reading that lands late
+let usageHold: Promise<unknown> | undefined
+// set once the held answer has gone back to the module
+let usageHeldOut = false
 
-function fakeEngine(on: On, env: Record<string, string>, calls: Calls, cache = { read: 80_000, write: 1_000 }, limits: { kind: string; percentUsed: number; resetsAt?: string }[] = [], money?: { usd: number }) {
-  on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: limits, ...(money ? { cost: { usd: money.usd } } : {}) } }) as never)
+function fakeEngine(
+  on: On,
+  env: Record<string, string>,
+  calls: Calls,
+  cache = { read: 80_000, write: 1_000 },
+  limits: { kind: string; percentUsed: number; resetsAt?: string }[] = [],
+  money?: { usd: number },
+  { clock = true } = {},
+) {
+  argvs = []
+  gitRun = undefined
+  usageHold = undefined
+  usageHeldOut = false
+  ghRate = ''
+  modelId = 'claude-opus-5-5'
+  ghExit = { exitCode: 0, stderr: '' }
+  on('session.usage', async () => {
+    const value = { startedAt: 0, context: {}, rateLimits: limits, ...(money ? { cost: { usd: money.usd } } : {}) }
+    const hold = usageHold
+    usageHold = undefined
+    if (hold) {
+      await hold
+      usageHeldOut = true
+    }
+    return { value } as never
+  })
   on('turn.start', async ($, e) => ({ turnId: e.turnId }) as never)
   on('session.start', async ($, e) => ({ cwd: e.cwd }) as never)
   on('session.end', async () => ({ sessionId: 's1' }) as never)
   on('env.get', ($, e) => ({ value: env[e.name] }))
-  on('session.model', () => ({ value: 'claude-opus-5-5' }) as never)
+  on('session.model', () => ({ value: modelId }) as never)
   // gh's rate_limit answers ghRate (nothing parseable by default); git status and gh --version the branch
-  on('process.run', ($, e) => {
-    const stdout = (e as { argv: string[] }).argv[1] === 'api' ? ghRate : '## main...origin/main [ahead 1]\n M hooks/x.ts\n'
-    return { value: { exitCode: 0, stdout, stderr: '' } } as never
+  on('process.run', async ($, e) => {
+    const argv = (e as { argv: string[] }).argv
+    argvs.push(argv)
+    if (argv.includes('status') && gitRun) return (await gitRun()) as never
+    if (argv[1] === 'api') return { value: { stdout: ghRate, ...ghExit } } as never
+    return { value: { exitCode: 0, stdout: '## main...origin/main [ahead 1]\n M hooks/x.ts\n', stderr: '' } } as never
   })
   on('command.register', () => ({ value: undefined }) as never)
-  on('clock.every', () => ({ value: undefined }) as never)
+  if (clock) on('clock.every', () => ({ value: undefined }) as never)
   on('ui.open', () => ({ value: undefined }) as never)
-  on('ui.close', () => ({ value: undefined }) as never)
+  on('ui.close', ($, e) => {
+    calls.closed?.push((e as { id: string }).id)
+    return { value: undefined } as never
+  })
   on('ui.invalidate', () => ({ value: undefined }) as never)
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', ($, e) => {
+    calls.toasts?.push(String((e as { text: unknown }).text))
+    return { value: undefined }
+  })
   on('ui.log', ($, e) => {
     calls.logs.push(String((e as { text: unknown }).text))
     return { value: undefined }
@@ -276,12 +320,12 @@ describe('the band', () => {
   test('the turn shows what it spent, the session its total', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     const money = { usd: 1.2 }
-    const limits = [{ kind: 'five_hour', percentUsed: 10 }]
-    fakeEngine(on, {}, calls, undefined, limits, money)
+    const five = { kind: 'five_hour', percentUsed: 10 }
+    fakeEngine(on, {}, calls, undefined, [five], money)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
     await $.turn.start({ text: 'hi', turnId: 't1' } as never)
     money.usd = 1.62
-    limits[0].percentUsed = 10.8
+    five.percentUsed = 10.8
     await step($)
     const ui = await $.ui.mount({ plugin: 'prompt-glance', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 160 } as never })
     expect(await ui.find({ type: 'Text', text: /^Turn $/ })).toBeDefined()
@@ -311,6 +355,7 @@ describe('the band', () => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { ENABLE_PROMPT_CACHING_1H: '1' }, calls)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await loaded(calls)
     expect(calls.logs.join('\n')).toContain('1h cache (ENABLE_PROMPT_CACHING_1H)')
     await step($)
     const ui = await band($)
@@ -322,6 +367,7 @@ describe('the band', () => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls, undefined, [{ kind: 'five_hour', percentUsed: 12 }])
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await loaded(calls)
     expect(calls.logs.join('\n')).toContain('1h cache (Claude subscription default)')
   })
 
@@ -329,6 +375,7 @@ describe('the band', () => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }, calls, undefined, [{ kind: 'five_hour', percentUsed: 12 }])
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await loaded(calls)
     expect(calls.logs.join('\n')).toContain('5m cache (CLAUDE_CODE_PROMPT_CACHE_TTL)')
   })
 
@@ -336,6 +383,7 @@ describe('the band', () => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { ENABLE_PROMPT_CACHING_1H: '1' }, calls)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await loaded(calls)
     expect(calls.logs.join('\n')).toContain('5m cache (the ttl option)')
   })
 
@@ -346,7 +394,10 @@ describe('the band', () => {
     await step($)
     const ui = await band($)
     expect(await ui.find({ type: 'Text', text: /not cached/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /━/ })).toBeUndefined()
+    // no lifetime label and no time left: what the band draws only while it counts down
+    expect(await ui.find({ type: 'Text', text: /^(5m|1h) $/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^\d+[smhd]$/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^  hit $/ })).toBeDefined()
     await ui.unmount()
   })
 
@@ -361,7 +412,9 @@ describe('the band', () => {
     // after a request the band still shows no countdown
     await step($)
     const after = await band($)
-    expect(await after.find({ type: 'Text', text: /━/ })).toBeUndefined()
+    expect(await after.find({ type: 'Text', text: /caching off/ })).toBeDefined()
+    expect(await after.find({ type: 'Text', text: /^(5m|1h) $/ })).toBeUndefined()
+    expect(await after.find({ type: 'Text', text: /^\d+[smhd]$/ })).toBeUndefined()
     await after.unmount()
   })
 })
@@ -442,7 +495,7 @@ describe('hud helpers', () => {
   test('tools are ranked by use, MCP names shortened', () => {
     const t = new Map([['Bash', { ok: 18, failed: 1 }], ['mcp__codegraph__codegraph_explore', { ok: 2, failed: 0 }], ['Edit', { ok: 5, failed: 0 }]])
     expect(topTools(t, 2)).toEqual([['Bash', 18, 1], ['Edit', 5, 0]])
-    expect(topTools(t, 3)[2][0]).toBe('codegraph_explore')
+    expect(topTools(t, 3)[2]?.[0]).toBe('codegraph_explore')
   })
 })
 
@@ -458,16 +511,16 @@ describe('heat gauges', () => {
   test('a full strip runs green to red; the rest of the track is grey', () => {
     const full = heatGauge(100, 10, SCALE.window)
     expect(full.map(s => s.text).join('')).toBe('██████████')
-    expect(full[0].color).toBe(HEAT[0])
-    expect(full[full.length - 1].color).toBe(HEAT[4])
+    expect(full[0]?.color).toBe(HEAT[0])
+    expect(full.at(-1)?.color).toBe(HEAT[4])
     const part = heatGauge(30, 10, SCALE.window)
     expect(part.map(s => s.text).join('')).toBe('██████████')
-    expect(part[part.length - 1].color).toBe(TRACK)
+    expect(part.at(-1)?.color).toBe(TRACK)
     // the last filled cell moves by eighths over the track
     const smooth = heatGauge(35, 10, SCALE.window)
     expect(smooth.map(s => s.text).join('')).toBe('███▌██████')
     expect(smooth.find(s => s.text === '▌')?.backgroundColor).toBe(TRACK)
-    expect(heatGauge(1, 10, SCALE.window)[0].text).toBe('▏')
+    expect(heatGauge(1, 10, SCALE.window)[0]?.text).toBe('▏')
   })
 })
 
@@ -565,14 +618,17 @@ async function settle(until: () => Promise<boolean>) {
   for (let i = 0; i < 2000 && !(await until()); i++) await Promise.resolve()
 }
 
+// the startup line comes once the first reading (and with it the account) has landed
+const loaded = (calls: Calls) => settle(async () => calls.logs.some(l => l.includes('prompt-glance loaded')))
+
 const HINT = ($: Engine) =>
   $.ui.mount({ plugin: 'prompt-glance', surface: 'terminal', component: 'PromptHint', props: { isDraft: false, isWorking: false, hint: 'bypass permissions on' } as never, viewport: { columns: 160, rows: 40 } } as never)
 
 describe('under the prompt', () => {
   test('position below draws the HUD under the prompt with the hint after it, and the band above stays the engine\'s', { options: { position: 'below' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
-    ghRate = '4000\t5000\t1761300000\n'
     fakeEngine(on, {}, calls)
+    ghRate = '4000\t5000\t1761300000\n'
     // stands for the engine's own band above the prompt
     on('ui.render', ($, e) => {
       const { Text } = $.ui.resolve(e)
@@ -594,8 +650,8 @@ describe('under the prompt', () => {
 
   test('no token: GH says not logged in instead of a percentage', { options: { position: 'below' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
-    ghRate = '55\t60\t1761300000\n'
     fakeEngine(on, {}, calls)
+    ghRate = '55\t60\t1761300000\n'
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
     await step($)
     const ui = await HINT($)
@@ -606,7 +662,6 @@ describe('under the prompt', () => {
 
   test('by default the hint line stays the engine\'s', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
-    ghRate = ''
     fakeEngine(on, {}, calls)
     // stands for the engine's own hint line
     on('ui.render', ($, e) => {
@@ -619,5 +674,427 @@ describe('under the prompt', () => {
     expect(await ui.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /^engine hint$/ })).toBeDefined()
     await ui.unmount()
+  })
+})
+
+const PANE_PROPS = { title: 'cache', isFocused: true, bodyColumns: 60, placement: 'inline', scroll: { offset: 0, bodyRows: 40 }, view: {} }
+const pane = ($: Engine, surface: 'terminal' | 'desktop' = 'terminal', bodyRows = 40, viewportRows = 40) =>
+  $.ui.mount({ plugin: 'prompt-glance', surface, component: 'Pane', requestId: 'cache', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } as never, viewport: { columns: 100, rows: viewportRows } } as never)
+const wide = ($: Engine, props: Record<string, unknown> = {}) =>
+  $.ui.mount({ plugin: 'prompt-glance', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 160, ...props } as never })
+const START = { cwd: '/repo', surface: 'terminal', isInteractive: true } as never
+const END = (reason: string) => ({ reason, sessionId: 's1', resume: {} }) as never
+// stands for the engine's own drawing under the plugin
+const engineDraws = (on: On) =>
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine</Text>
+  })
+
+describe('turns and subagents', () => {
+  test('a subagent starting mid-turn leaves the main turn\'s baseline alone', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const money = { usd: 1.2 }
+    fakeEngine(on, {}, calls, undefined, [], money)
+    await $.session.start(START)
+    await $.turn.start({ text: 'hi', turnId: 't1' } as never)
+    money.usd = 1.5
+    // the main loop's first request lands, and with it the $1.50 the turn has spent so far, before the subagent starts
+    await step($)
+    const before = await wide($)
+    await settle(async () => (await before.find({ type: 'Text', text: /^\$1\.50$/ })) !== undefined)
+    expect(await before.find({ type: 'Text', text: /^\$0\.30$/ })).toBeDefined()
+    await before.unmount()
+    await $.turn.start({ text: 'go', turnId: 't2', agentId: 'a1' } as never)
+    money.usd = 1.62
+    await step($, { index: 1 })
+    const ui = await wide($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /^\$1\.62$/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^\$0\.42$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^\$0\.12$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a reading that lands late, across a turn boundary, does not skew the next turn', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const money = { usd: 1.2 }
+    fakeEngine(on, {}, calls, undefined, [], money)
+    await $.session.start(START)
+    await $.turn.start({ text: 'hi', turnId: 't1' } as never)
+    money.usd = 1.5
+    // the reading after the first turn's request is slow: it is still out when the next turn starts
+    let release = () => {}
+    usageHold = new Promise<void>(r => (release = r))
+    await step($)
+    await $.turn.start({ text: 'again', turnId: 't2' } as never)
+    money.usd = 1.62
+    await step($, { turnId: 't2' })
+    // and lands last, with the $1.50 it read: the newer reading stands
+    release()
+    await settle(async () => usageHeldOut)
+    for (let i = 0; i < 50; i++) await Promise.resolve()
+    const ui = await wide($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /^\$1\.62$/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^\$1\.62$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^\$0\.12$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^\$0\.42$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+})
+
+describe('a new conversation in the same process', () => {
+  test('/clear starts the meter and the activity over', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    on('tool.call', async () => ({ result: 'ok' }) as never)
+    await $.session.start(START)
+    await step($)
+    await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+    await $.session.end(END('clear'))
+    const ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /waiting for first request/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^  hit $/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^Bash$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('/clear of an expensive conversation: the next turn shows what it spent, not the old total', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const money = { usd: 4.8 }
+    fakeEngine(on, {}, calls, undefined, [], money)
+    await $.session.start(START)
+    await $.turn.start({ text: 'hi', turnId: 't1' } as never)
+    money.usd = 5
+    await step($)
+    const old = await wide($)
+    await settle(async () => (await old.find({ type: 'Text', text: /^\$5\.00$/ })) !== undefined)
+    await old.unmount()
+    // a reading taken as the conversation ends still sees the old $5, and is slow to land
+    let release = () => {}
+    usageHold = new Promise<void>(r => (release = r))
+    await $.session.end(END('clear'))
+    // the new conversation counts from zero, and its first prompt comes before that reading lands
+    money.usd = 0
+    await $.turn.start({ text: 'new', turnId: 't2' } as never)
+    money.usd = 0.2
+    await step($, { turnId: 't2' })
+    release()
+    await settle(async () => usageHeldOut)
+    for (let i = 0; i < 50; i++) await Promise.resolve()
+    const ui = await wide($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /^\$0\.20$/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^Turn $/ })).toBeDefined()
+    // the turn and the session both spent $0.20
+    expect((await ui.findAll({ type: 'Text', text: /^\$0\.20$/ })).length).toBe(2)
+    expect(await ui.find({ type: 'Text', text: /^\$0\.00$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a resume starts the meter over and the clock keeps ticking', { options: { status: true } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() })
+    fakeEngine(on, {}, calls, undefined, [], undefined, { clock: false })
+    await $.session.start(START)
+    await step($)
+    await clock.advance(1000)
+    expect(calls.status.at(-1)).toMatch(/^cache 98%/)
+    await $.session.end(END('resume'))
+    await clock.advance(1000)
+    // the old conversation's request is gone, and the tick says so
+    expect(calls.status.at(-1)).toMatch(/^cache: no request yet/)
+    // and still runs: a /model switch shows within a second, with no request
+    modelId = 'claude-sonnet-5-5'
+    await clock.advance(1000)
+    const ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^Sonnet 5\.5$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^  hit $/ })).toBeUndefined()
+    await ui.unmount()
+  })
+})
+
+describe('nothing waits on git', () => {
+  test('a slow git status holds no hook; the band draws what it has, the branch when git answers', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() })
+    fakeEngine(on, {}, calls, undefined, [], { usd: 0.5 }, { clock: false })
+    // git takes 8 seconds to answer
+    gitRun = () => clock.sleep(8_000).then(() => ({ value: { exitCode: 0, stdout: '## main\n', stderr: '' } }))
+    await $.session.start(START)
+    await $.turn.start({ text: 'hi', turnId: 't1' } as never)
+    await step($)
+    const ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Session $/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^main$/ })).toBeUndefined()
+    await ui.unmount()
+    await clock.advance(8_000)
+    const later = await wide($)
+    expect(await later.find({ type: 'Text', text: /^main$/ })).toBeDefined()
+    await later.unmount()
+  })
+
+  test('git status runs without the optional index lock', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    await $.session.start(START)
+    await settle(async () => argvs.some(a => a.includes('status')))
+    const git = argvs.find(a => a.includes('status'))
+    expect(git?.slice(0, 3)).toEqual(['git', '--no-optional-locks', 'status'])
+  })
+})
+
+describe('the GitHub gauge', () => {
+  test('gh never logged in says 未登入', { options: { position: 'below' } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    ghRate = ''
+    ghExit = { exitCode: 4, stderr: 'To get started with GitHub CLI, please run:  gh auth login\n' }
+    await $.session.start(START)
+    await step($)
+    const ui = await HINT($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /未登入/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^未登入$/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a failed refresh marks the reading stale, and drops it once its window has reset', { options: { position: 'below' } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() })
+    fakeEngine(on, {}, calls, undefined, [], undefined, { clock: false })
+    const soon = Math.ceil(Date.now() / 1000) + 3600
+    ghRate = `4000\t5000\t${soon}\n`
+    await $.session.start(START)
+    await step($)
+    const ui = await HINT($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /^ 20%$/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^ 20%$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^ \?$/ })).toBeUndefined()
+    // the next refresh fails: the reading stays, marked as old
+    await ui.unmount()
+    ghExit = { exitCode: 1, stderr: 'error connecting to api.github.com\n' }
+    await clock.advance(120_000)
+    const later = await HINT($)
+    expect(await later.find({ type: 'Text', text: /^ 20%$/ })).toBeDefined()
+    expect(await later.find({ type: 'Text', text: /^ \?$/ })).toBeDefined()
+    await later.unmount()
+  })
+
+  test('a stale reading whose window has reset is not drawn', { options: { position: 'below' } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() })
+    fakeEngine(on, {}, calls, undefined, [], undefined, { clock: false })
+    ghRate = `4000\t5000\t${Math.floor(Date.now() / 1000) - 1}\n`
+    await $.session.start(START)
+    await step($)
+    const ui = await HINT($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /^ 20%$/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^ 20%$/ })).toBeDefined()
+    await ui.unmount()
+    ghExit = { exitCode: 1, stderr: 'timeout\n' }
+    await clock.advance(120_000)
+    const later = await HINT($)
+    expect(await later.find({ type: 'Text', text: /^GH/ })).toBeUndefined()
+    await later.unmount()
+  })
+})
+
+describe('the clock', () => {
+  test('a large prompt toasts at the warning threshold', { options: { warnSeconds: 300 } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [], toasts: [] }
+    const clock = mock.clock(on, { now: Date.now() })
+    fakeEngine(on, {}, calls, undefined, [], undefined, { clock: false })
+    await $.session.start(START)
+    await step($)
+    await clock.advance(1000)
+    expect(calls.toasts).toEqual([expect.stringMatching(/^cache expires in [45]:\d\d: send a message to keep 81\.3k tokens warm$/)])
+    // once per mark: the next tick says nothing new
+    await clock.advance(1000)
+    expect(calls.toasts?.length).toBe(1)
+  })
+
+  test('a small prompt never toasts', { options: { warnSeconds: 300 } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [], toasts: [] }
+    const clock = mock.clock(on, { now: Date.now() })
+    fakeEngine(on, {}, calls, { read: 10_000, write: 500 }, [], undefined, { clock: false })
+    await $.session.start(START)
+    await step($)
+    await clock.advance(3000)
+    expect(calls.toasts).toEqual([])
+  })
+
+  test('the tick redraws the status line and a /model switch with no request', { options: { status: true } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() })
+    fakeEngine(on, {}, calls, undefined, [], undefined, { clock: false })
+    await $.session.start(START)
+    await clock.advance(1000)
+    expect(calls.status).toEqual([expect.stringMatching(/^cache: no request yet/)])
+    modelId = 'claude-haiku-4-5'
+    await clock.advance(1000)
+    const ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^Haiku 4\.5$/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a hit 20 minutes after the last request switches the lifetime to the observed hour', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    // the clock the requests are timed by: the first 20 minutes ago, the second now
+    let at = Date.now() - 20 * 60_000
+    on('clock.now', () => ({ value: at }) as never)
+    fakeEngine(on, {}, calls)
+    on('command.run', () => ({ text: '' }) as never)
+    await $.session.start(START)
+    await step($)
+    at = Date.now()
+    await step($, { turnId: 't2' })
+    const reply = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((reply as { text: string }).text).toMatch(/^1h cache \(observed from request timing; default said 5m\)/)
+  })
+})
+
+describe('/cache', () => {
+  test('opens the pane, which takes the band\'s place; stop closes it and the band comes back', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    on('command.run', () => ({ text: '' }) as never)
+    engineDraws(on)
+    await $.session.start(START)
+    await step($)
+    await step($, { turnId: 't2' })
+    await step($, { turnId: 't2', index: 1 })
+    const reply = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((reply as { text: string }).text).toMatch(/^5m cache \(default\) · .* · \/cache stop closes$/)
+    const yielded = await wide($)
+    expect(await yielded.find({ type: 'Text', text: /^engine$/ })).toBeDefined()
+    expect(await yielded.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeUndefined()
+    await yielded.unmount()
+
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await pane($, surface)
+      expect(await ui.find({ type: 'Text', text: /PROMPT.CACHE/ })).toBeDefined()
+      // a row per turn: the second turn's two requests summed
+      expect(await ui.find({ key: 't:t1' })).toBeDefined()
+      expect((await ui.findAll({ type: 'Text', in: undefined })).some(t => t.text === '2')).toBe(true)
+      expect(await ui.find({ type: 'Button', key: 'close' })).toBeDefined()
+      await ui.unmount()
+    }
+
+    await $.command.run({ command: 'cache', args: 'stop' } as never)
+    const back = await wide($)
+    expect(await back.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeDefined()
+    await back.unmount()
+  })
+
+  test('the close button closes the pane and the band comes back', async ($, on) => {
+    const calls: Calls = { status: [], logs: [], closed: [] }
+    fakeEngine(on, {}, calls)
+    on('command.run', () => ({ text: '' }) as never)
+    await $.session.start(START)
+    await step($)
+    await $.command.run({ command: 'cache', args: '' } as never)
+    const ui = await pane($)
+    await ui.press({ key: 'close' })
+    await ui.unmount()
+    expect(calls.closed).toEqual(['cache'])
+    const back = await wide($)
+    expect(await back.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeDefined()
+    await back.unmount()
+  })
+
+  test('the table takes the pane\'s own rows, numbering turns from the session\'s first', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    await $.session.start(START)
+    for (let i = 1; i <= 205; i++) await step($, { turnId: `t${i}` })
+    // a tall terminal, a short pane: the pane's room decides
+    const ui = await pane($, 'terminal', 26, 60)
+    expect(await ui.find({ key: 't:t205' })).toBeDefined()
+    expect(await ui.find({ key: 't:t190' })).toBeUndefined()
+    const last = await ui.find({ key: 'c:turn:t205' })
+    expect(last?.text).toBe('205')
+    await ui.unmount()
+  })
+})
+
+describe('the band gives way', () => {
+  test('to a survey', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    engineDraws(on)
+    await $.session.start(START)
+    await step($)
+    const ui = await wide($, { hasSurvey: true })
+    expect(await ui.find({ type: 'Text', text: /^engine$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('to nothing at all when the band is off, above or below', { options: { band: false } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    engineDraws(on)
+    await $.session.start(START)
+    await step($)
+    for (const ui of [await wide($), await HINT($)]) {
+      expect(await ui.find({ type: 'Text', text: /^engine$/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeUndefined()
+      await ui.unmount()
+    }
+  })
+})
+
+describe('the activity and the windows', () => {
+  test('a failed tool call counts as failed; a skill shows under Skills, not Tools', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    on('tool.call', async ($, e) => ((e as { command?: string }).command === 'false' ? { result: 'exit 1', isError: true } : { result: 'ok' }) as never)
+    await $.session.start(START)
+    await step($)
+    await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'false' } as never)
+    await $.tool.call({ tool: 'Skill', skill: 'tdd' } as never)
+    const ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^×2$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^  ✗1$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^(  )?Skill$/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^tdd$/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('only a window past half shows when it resets', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const at = (h: number) => new Date(Date.now() + h * 3600_000).toISOString()
+    fakeEngine(on, {}, calls, undefined, [
+      { kind: 'five_hour', percentUsed: 72, resetsAt: at(3) },
+      { kind: 'seven_day', percentUsed: 3, resetsAt: at(100) },
+    ])
+    await $.session.start(START)
+    await step($)
+    const ui = await wide($, { bodyColumns: 150 })
+    await settle(async () => (await ui.find({ type: 'Text', text: /^ 72%$/ })) !== undefined)
+    expect((await ui.findAll({ type: 'Text', text: /↻/ })).map(t => t.text)).toEqual([' ↻3h'])
+    await ui.unmount()
+  })
+})
+
+describe('the promptCacheTtl setting', () => {
+  test('the project\'s local settings win over the project\'s and the user\'s', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, { HOME: '/home/u' }, calls, undefined, [{ kind: 'five_hour', percentUsed: 12 }])
+    const files: Record<string, string> = {
+      '/repo/.claude/settings.local.json': '{"promptCacheTtl":"5m"}',
+      '/repo/.claude/settings.json': '{"promptCacheTtl":"1h"}',
+      '/home/u/.claude/settings.json': '{"promptCacheTtl":"1h"}',
+    }
+    on('session.cwd', () => ({ value: '/repo' }) as never)
+    on('fs.read', ($, e) => {
+      const text = files[(e as { path: string }).path]
+      if (text === undefined) throw new Error('ENOENT')
+      return { value: text } as never
+    })
+    on('fs.write', () => ({ value: undefined }) as never)
+    await $.session.start(START)
+    await loaded(calls)
+    expect(calls.logs.join('\n')).toContain('5m cache (the promptCacheTtl setting)')
   })
 })

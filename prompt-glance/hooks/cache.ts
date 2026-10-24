@@ -258,14 +258,17 @@ export function segments(read: number, write: number, fresh: number, width: numb
   let over = cells.reduce((a, b) => a + b, 0) - width
   while (over !== 0) {
     const i = over > 0 ? cells.indexOf(Math.max(...cells)) : parts.indexOf(Math.max(...parts))
-    cells[i] += over > 0 ? -1 : 1
+    const c = cells[i]
+    if (c === undefined) break
+    cells[i] = c + (over > 0 ? -1 : 1)
     over += over > 0 ? -1 : 1
   }
-  return [cells[0], cells[1], cells[2]]
+  const [r = 0, w = 0, n = 0] = cells
+  return [r, w, n]
 }
 
 /** Seconds left at which a toast counts down after the one at the warning threshold. */
-export const COUNTDOWN_MARKS = [10, 3, 2, 1]
+export const COUNTDOWN_MARKS = [10, 3, 2, 1] as const
 
 /**
  * The toast mark to fire now, or undefined. `level` is the mark last fired for
@@ -366,6 +369,10 @@ export function sessionHit(samples: readonly Sample[]): number {
 /** How many requests wrote the prefix again instead of reading it (missReason names a cause). */
 export function countMisses(samples: readonly Sample[], ttl: Ttl): number {
   let n = 0
-  for (let i = 1; i < samples.length; i++) if (missReason(samples[i - 1], samples[i], ttl)) n++
+  for (let i = 1; i < samples.length; i++) {
+    const prev = samples[i - 1]
+    const cur = samples[i]
+    if (cur && missReason(prev, cur, ttl)) n++
+  }
   return n
 }

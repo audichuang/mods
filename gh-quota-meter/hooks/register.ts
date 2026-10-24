@@ -27,9 +27,12 @@ export const register: Register = (on, options) => {
       return next(e)
     }
 
+    const home = await $.env.get('HOME')
+    // gh runs in HOME: the session's cwd can be deleted under it (a removed worktree), and then nothing starts there.
+    const cwd = home ?? '/'
+
     // $.fs.write replaces the whole file, so append by rewriting the tail.
     const log = async (event: string, detail: string) => {
-      const home = await $.env.get('HOME')
       if (home === undefined) {
         return
       }
@@ -44,7 +47,7 @@ export const register: Register = (on, options) => {
     // gh with an offline `--version` first; a rejected rate_limit call then means a timeout.
     const findGh = async () => {
       for (const bin of GH) {
-        const ran = await $.process.run([bin, '--version'], { timeoutMs: 5_000 }).catch(() => undefined)
+        const ran = await $.process.run([bin, '--version'], { cwd, timeoutMs: 5_000 }).catch(() => undefined)
         if (ran?.exitCode === 0) {
           return bin
         }
@@ -57,9 +60,13 @@ export const register: Register = (on, options) => {
       if (gh === undefined) {
         return { kind: 'no-gh', text: 'GH 額度：找不到 gh', detail: GH.join(' ') }
       }
-      const ran = await $.process.run([gh, 'api', 'rate_limit', '--jq', JQ], { timeoutMs: 15_000 }).catch(() => undefined)
+      const ran = await $.process.run([gh, 'api', 'rate_limit', '--jq', JQ], { cwd, timeoutMs: 15_000 }).catch(() => undefined)
       if (ran === undefined) {
         return { kind: 'timeout', text: 'GH 額度：查詢逾時', detail: gh }
+      }
+      // gh exits 4 when it has no credentials at all, without asking GitHub.
+      if (ran.exitCode === 4) {
+        return { kind: 'anon', text: 'GH 未登入 · gh auth login', detail: `exit 4: ${ran.stderr.trim().slice(0, 200)}` }
       }
       if (ran.exitCode !== 0) {
         return { kind: 'fail', text: 'GH 額度：查詢失敗', detail: `exit ${ran.exitCode}: ${ran.stderr.trim().slice(0, 200)}` }
