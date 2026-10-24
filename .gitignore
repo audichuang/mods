@@ -4,3 +4,5 @@
 hello-above-prompt/
 .claude-plugin/types/
 */.claude-plugin/types/
+__pycache__/
+*.pyc
