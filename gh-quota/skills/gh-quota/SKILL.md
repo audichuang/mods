@@ -16,8 +16,10 @@ gh-wait run <run-id> -R owner/repo     # 等一個 workflow run
 gh-wait pr <number> -R owner/repo      # 等 PR head commit 的所有 checks
 ```
 
-- 結束碼：0 成功、1 失敗（`pr` 印出失敗的 check，`run` 印出失敗的 job）、2 參數錯誤、API 錯誤或逾時（stderr 會寫是哪一種）。
+- 結束碼：0 成功、1 失敗（`pr` 印出失敗的 check，`run` 印出失敗的 job）、2 參數錯誤、API 錯誤或逾時（stderr 會寫是哪一種，並附上 gh 自己的錯誤訊息）。
 - 選項：`-i` 輪詢秒數（預設 15）、`-t` 逾時分鐘（預設 120）。
+- 需要 `gh` 和 `jq`；沒有 jq 會立刻說明並結束。
+- gh 沒登入會立刻結束（結束碼 2）；網路錯誤或 5xx 會重試，連續 5 次才放棄；額度用完（403／429 且剩 0）會等到重置時間再繼續，不算錯誤。
 - 它帶 ETag 做條件請求，狀態沒變時 GitHub 回 304，不扣額度；只有狀態真的變了才算一次。
 - 狀態 5 分鐘沒變會印 `unchanged for N min: …`（`pr` 模式會列出還在跑的 check）；一直卡住就是 CI 本身卡死，不是還在正常等。
 - `pr` 模式看 head commit 的 check runs（Actions 與其他 GitHub App），不看外部服務的舊式 commit status，最多讀 100 個 check；等待中 PR 又 push，它仍盯著開始時的那個 commit。
@@ -30,10 +32,11 @@ gh-wait pr <number> -R owner/repo      # 等 PR head commit 的所有 checks
 
 - `gh run watch`：每輪 2 個請求再加每個執行中 job 1 個，預設 3 秒一輪，一個掛一小時約 2400 次。
 - `gh pr checks --watch`：固定間隔輪詢。
-- `while … gh … sleep N` 自寫迴圈，或 `watch … gh`。
-- 沒帶 token 的 `curl`／`wget` 打 `api.github.com`：吃的是出口 IP 共用的每小時 60 次匿名額度，改用 `gh api`。
+- 自寫迴圈輪詢 gh：`while`／`until`／`for` 迴圈裡呼叫 gh 的任何子指令（`api`、`run`、`pr`、`issue`、`workflow`、`release`…，用絕對路徑呼叫也算；只有 `auth`、`config`、`alias`、`completion`、`help`、`version` 不算），且 sleep 少於 60 秒、sleep 的秒數是變數或算式，或是 `while`／`until` 完全沒 sleep。`for` 跑固定清單又沒 sleep 算批次，不擋。
+- `watch … gh`。
+- 沒帶 token 的 `curl`／`wget` 打 `api.github.com`：吃的是出口 IP 共用的每小時 60 次匿名額度，改用 `gh api`。token（`Authorization:` header、`$GH_TOKEN`、`$(gh auth token)`）要寫在同一個 curl 指令裡才算。
 
-這些會被 plugin 的 hook 擋下。
+這些會被 plugin 的 hook 擋下，包括寫在 `-R owner/repo` 後面、包在 `bash -c '…'`／`sh -c`／`ssh host '…'`／`eval '…'` 裡的（遠端沒有 hook）。
 
 ## 查額度
 
@@ -44,7 +47,7 @@ gh-wait pr <number> -R owner/repo      # 等 PR head commit 的所有 checks
 各台記各自的，放在 `~/.local/state/gh-quota/`：
 
 - `hook.log`：hook 每擋一次寫一行 JSON（ts、host、session、cwd、reason、cmd）。看誤擋或常犯的寫法：`tail -n 50 ~/.local/state/gh-quota/hook.log | jq -c '{ts,reason,cmd}'`，按原因統計：`jq -r .reason ~/.local/state/gh-quota/hook.log | sort | uniq -c | sort -rn`。超過 1 MB 輪替成 `hook.log.1`。
-- `meter.log`：狀態列 mod 的事件，tab 分隔（時間、事件、細節）。事件有 `start`、`ok`、`no-gh`、`timeout`、`fail`、`bad-output`、`warn`，只在狀態類型改變時記，保留最後 500 行。
+- `meter.log`：狀態列 mod 的事件，tab 分隔（時間、事件、細節）。事件有 `start`（每個互動 session 開始記一次）、`warn`（額度偏低，每個重置週期一次），以及查詢結果 `ok`、`anon`（gh 沒登入，看到的是匿名額度）、`no-gh`、`timeout`、`fail`、`bad-output`（這六種只在類型改變時記）；保留最後 500 行。
 - ubuntu 另有 `~/.local/state/gh-rate.log`：每 5 分鐘整個帳號的用量，用來對時間找出是誰在燒額度。
 
-看到誤擋就把那條指令加進 `tests/hooktest.sh` 當 allow 案例再修 hook；看到漏擋就加 DENY 案例。
+看到誤擋就把那條指令加進 `tests/hooktest.sh` 當 allow 案例再修 hook；看到漏擋就加 DENY 案例。gh-wait 的行為測在 `tests/gh-wait-test.sh`（假的 gh 放 PATH 最前面）。

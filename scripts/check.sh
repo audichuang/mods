@@ -85,9 +85,12 @@ done
 
 step "gh-quota（Python command hook 與 bash）"
 python3 -B -c 'import ast,sys;[ast.parse(open(f).read(),f) for f in sys.argv[1:]]' gh-quota/hooks/*.py || fail "gh-quota Python 語法"
-if out=$(bash gh-quota/tests/hooktest.sh 2>&1) && ! grep -qv '^ok ' <<<"$out"; then
-  echo "ok   hooktest：$(grep -c '^ok ' <<<"$out") 個案例"
-else echo "$out" | grep -v '^ok '; fail "gh-quota hooktest"; fi
+for t in gh-quota/tests/*.sh; do
+  n=$(basename "$t" .sh)
+  if out=$(bash "$t" 2>&1) && ! grep -qv '^ok ' <<<"$out"; then
+    echo "ok   ${n}：$(grep -c '^ok ' <<<"$out") 個案例"
+  else echo "$out" | grep -v '^ok '; fail "gh-quota $n"; fi
+done
 if command -v shellcheck >/dev/null; then
   shellcheck -S warning gh-quota/bin/gh-wait gh-quota/tests/*.sh scripts/*.sh && echo "ok   shellcheck" || fail "shellcheck"
 else echo "略過 shellcheck（沒裝；CI 會跑）"; fi
