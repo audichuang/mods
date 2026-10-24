@@ -2,8 +2,15 @@
 # PreToolUse(Bash): block GitHub API polling patterns that burn the shared 5000/hr quota,
 # and point the agent at gh-wait (ETag conditional requests; 304s are free).
 import json
+import os
 import re
+import socket
 import sys
+import time
+
+# One JSON line per deny, so false positives and real offenders can be reviewed later.
+LOG = os.path.expanduser('~/.local/state/gh-quota/hook.log')
+LOG_MAX_BYTES = 1_000_000
 
 # Command position: start of line or after ; & | ( ! quote `$(` do/then/while/until/if,
 # then optional VAR=x and wrappers. Quotes count so that `ssh host 'gh run watch'` and
@@ -30,7 +37,8 @@ GH_CALL = re.compile(POS + r'gh\s+(?:api|run|pr)\b')
 SLEEP = re.compile(r'\bsleep\s+(\d+(?:\.\d+)?)([smhd]?)\b')
 UNIT = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
 # Anonymous REST calls share the exit IP's 60/hr; `gh api` uses the account's 5000/hr.
-ANON_CURL = re.compile(POS + r'(?:curl|wget)\b[^;&|\n]*api\.github\.com')
+# /rate_limit itself is free, so checking the anonymous quota is allowed.
+ANON_CURL = re.compile(POS + r'(?:curl|wget)\b[^;&|\n]*api\.github\.com(?!/rate_limit\b)')
 AUTH = re.compile(r'(?i)authorization:|\$\(gh auth token\)|\$\{?(?:GITHUB_TOKEN|GH_TOKEN)\b')
 
 HINT = ('等 CI 請改用 `gh-wait run <run-id> -R owner/repo` 或 `gh-wait pr <number> -R owner/repo`'
@@ -75,6 +83,24 @@ def reason(cmd):
     return None
 
 
+def log_deny(data, cmd, why):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        if os.path.exists(LOG) and os.path.getsize(LOG) > LOG_MAX_BYTES:
+            os.replace(LOG, LOG + '.1')
+        with open(LOG, 'a') as f:
+            f.write(json.dumps({
+                'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                'host': socket.gethostname(),
+                'session': data.get('session_id'),
+                'cwd': data.get('cwd'),
+                'reason': why.split('，')[0],
+                'cmd': cmd[:500],
+            }, ensure_ascii=False) + '\n')
+    except OSError:
+        pass
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -85,6 +111,7 @@ def main():
     cmd = (data.get('tool_input') or {}).get('command') or ''
     why = reason(cmd)
     if why:
+        log_deny(data, cmd, why)
         json.dump({'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
             'permissionDecision': 'deny',

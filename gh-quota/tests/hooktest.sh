@@ -31,7 +31,7 @@ DENY|watch gh run view 1
 DENY|while true; do gh run view 1 --json status; done
 DENY|for i in 1 2 3; do gh api x; sleep 30s; done
 DENY|curl -s https://api.github.com/repos/a/b/releases/latest
-DENY|wget -qO- https://api.github.com/rate_limit
+DENY|wget -qO- https://api.github.com/repos/a/b/commits/main
 allow|curl -s -H "Authorization: Bearer $(gh auth token)" https://api.github.com/repos/a/b
 allow|curl -fsSL https://github.com/a/b/releases/download/v1/x.tar.gz -o x.tgz
 DENY|env -u FOO gh run watch 1
@@ -45,6 +45,7 @@ DENY|while true; do gh api x; sleep 10
 DENY|nice -10 gh run watch 1
 DENY|stdbuf -o L gh run watch 1
 allow|for f in a b; do for g in c d; do echo $f$g; done; done; gh api x; sleep 5
+allow|curl -s -D - -o /dev/null https://api.github.com/rate_limit
 allow|curl -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/x
 allow|gh run view 1; while read l; do echo $l; done < f
 allow|while true; do gh api x; sleep 90; done; sleep 5

@@ -1,1 +1,1 @@
-{ "name": "gh-quota-meter", "version": "0.1.1", "description": "在狀態列顯示 GitHub API 剩餘額度（REST／GraphQL），低於 1000 時提醒一次。" }
+{ "name": "gh-quota-meter", "version": "0.1.2", "description": "在狀態列顯示 GitHub API 剩餘額度（REST／GraphQL），低於 1000 時提醒一次。" }

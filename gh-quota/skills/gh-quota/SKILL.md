@@ -38,3 +38,13 @@ gh-wait pr <number> -R owner/repo      # 等 PR head commit 的所有 checks
 ## 查額度
 
 `gh api rate_limit --jq .resources.core`（這個端點本身不扣額度）。ubuntu 每 5 分鐘把用量記在 `~/.local/state/gh-rate.log`（時間、已用、剩餘、GraphQL 已用、重置時間）。
+
+## 監控（持續優化用）
+
+各台記各自的，放在 `~/.local/state/gh-quota/`：
+
+- `hook.log`：hook 每擋一次寫一行 JSON（ts、host、session、cwd、reason、cmd）。看誤擋或常犯的寫法：`tail -n 50 ~/.local/state/gh-quota/hook.log | jq -c '{ts,reason,cmd}'`，按原因統計：`jq -r .reason ~/.local/state/gh-quota/hook.log | sort | uniq -c | sort -rn`。超過 1 MB 輪替成 `hook.log.1`。
+- `meter.log`：狀態列 mod 的事件，tab 分隔（時間、事件、細節）。事件有 `start`、`ok`、`no-gh`、`timeout`、`fail`、`bad-output`、`warn`，只在狀態類型改變時記，保留最後 500 行。
+- ubuntu 另有 `~/.local/state/gh-rate.log`：每 5 分鐘整個帳號的用量，用來對時間找出是誰在燒額度。
+
+看到誤擋就把那條指令加進 `tests/hooktest.sh` 當 allow 案例再修 hook；看到漏擋就加 DENY 案例。
