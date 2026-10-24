@@ -36,4 +36,5 @@
 |---|---|
 | `~/.local/state/gh-quota/hook.log` | hook 每擋一次一行 JSON（ts、host、session、cwd、reason、cmd） |
 | `~/.local/state/gh-quota/meter.log` | meter 的 start／ok／anon／warn／timeout／fail（狀態變化才寫） |
+| `~/.local/state/prompt-glance/hud.log` | HUD 畫在哪（below／above）、讓位原因、session.end 原因、render 錯誤（變化才寫） |
 | `~/.local/state/gh-rate.log`（ubuntu） | 時間、core 已用、剩餘、graphql 已用、重置時間 |
