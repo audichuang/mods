@@ -9,7 +9,8 @@ import sys
 import time
 
 # One JSON line per deny, so false positives and real offenders can be reviewed later.
-LOG = os.path.expanduser('~/.local/state/gh-quota/hook.log')
+# GH_QUOTA_HOOK_LOG overrides it (tests/hooktest.sh sets /dev/null so test cases don't pollute it).
+LOG = os.environ.get('GH_QUOTA_HOOK_LOG') or os.path.expanduser('~/.local/state/gh-quota/hook.log')
 LOG_MAX_BYTES = 1_000_000
 
 # Command position: start of line or after ; & | ( ! quote `$(` do/then/while/until/if,

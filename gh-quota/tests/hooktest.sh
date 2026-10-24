@@ -1,6 +1,7 @@
 #!/bin/bash
 # Pipe-test gh-quota-guard: "want|command" per line.
 H=${1:-$(dirname "$0")/../hooks/gh-quota-guard.py}
+export GH_QUOTA_HOOK_LOG=/dev/null
 fail=0
 while IFS='|' read -r want cmd; do
     [ -z "$want" ] && continue
