@@ -163,7 +163,16 @@ allow|while read l; do echo "gh is $l"; done < f
 allow|while true; do echo "gh is up"; sleep 5; done
 allow|git commit -m "guard: catch polling inside (bash -c 'while true; do gh api x; sleep 5; done') too"
 allow|echo "ssh ubuntu 'while true; do gh api x; sleep 5; done'"
-DENY:sleep 5 秒|while read r; do gh api "repos/$r"; sleep 5; done < repos.txt
+allow|while read r; do gh api "repos/$r"; sleep 5; done < repos.txt
+allow|for r in a b c; do gh repo clone me/$r; sleep 1; done
+allow|for r in $(cat list); do gh api repos/$r; sleep "$DELAY"; done
+allow|for r in a b; do gh repo view ${r}; sleep 5; done
+allow|while IFS= read -r r; do gh api "repos/${r}"; sleep 1; done < f
+allow|for h in mini mbp; do ssh $h gh api user; sleep 2; done
+DENY:sleep 5 秒|while read r; do gh api user; sleep 5; done < repos.txt
+DENY:sleep 5 秒|for r in a b; do echo $r; gh api user; sleep 5; done
+DENY:sleep 5 秒|for rr in a b; do gh api repos/$r; sleep 5; done
+DENY:sleep 5 秒|while true; do for r in a b; do gh api repos/$r; done; sleep 5; done
 DENY:沒有 sleep|while true; do read x; gh api "$x"; done
 DENY|while true; do echo "$(gh run view 1 --json status)"; sleep 5; done
 DENY|while true; do ssh ubuntu "gh api x"; sleep 5; done

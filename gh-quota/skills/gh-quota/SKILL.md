@@ -32,7 +32,7 @@ gh-wait pr <number> -R owner/repo      # 等 PR head commit 的所有 checks
 
 - `gh run watch`：每輪 2 個請求再加每個執行中 job 1 個，預設 3 秒一輪，一個掛一小時約 2400 次。
 - `gh pr checks --watch`：固定間隔輪詢。
-- 自寫迴圈輪詢 gh：`while`／`until`／`for` 迴圈裡呼叫 gh 的任何子指令（`api`、`run`、`pr`、`issue`、`workflow`、`release`…，用絕對路徑呼叫也算；只有 `auth`、`config`、`alias`、`completion`、`help`、`version` 不算），且 sleep 少於 60 秒、sleep 的秒數是變數或算式，或是 `while`／`until` 完全沒 sleep。`for` 跑固定清單又沒 sleep 算批次，不擋。
+- 自寫迴圈輪詢 gh：`while`／`until`／`for` 迴圈裡呼叫 gh 的任何子指令（`api`、`run`、`pr`、`issue`、`workflow`、`release`…，用絕對路徑呼叫也算；只有 `auth`、`config`、`alias`、`completion`、`help`、`version` 不算），且 sleep 少於 60 秒、sleep 的秒數是變數或算式，或是 `while`／`until` 完全沒 sleep。`for` 跑清單、`while read` 讀檔案或管線，只要每個 gh 呼叫都用到迴圈變數（`gh repo clone me/$r`），就算批次，sleep 多短都不擋；gh 沒用到迴圈變數（`for i in $(seq 30); do gh run view 1 …`）就是在輪詢同一個目標，照上面的規則擋。
 - `watch … gh`。
 - 沒帶 token 的 `curl`／`wget` 打 `api.github.com`：吃的是出口 IP 共用的每小時 60 次匿名額度，改用 `gh api`。token（`Authorization:` header、`$GH_TOKEN`、`$(gh auth token)`）要寫在同一個 curl 指令裡才算。
 
