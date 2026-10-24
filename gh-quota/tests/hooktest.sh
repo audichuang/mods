@@ -173,6 +173,12 @@ DENY:sleep 5 秒|while read r; do gh api user; sleep 5; done < repos.txt
 DENY:sleep 5 秒|for r in a b; do echo $r; gh api user; sleep 5; done
 DENY:sleep 5 秒|for rr in a b; do gh api repos/$r; sleep 5; done
 DENY:sleep 5 秒|while true; do for r in a b; do gh api repos/$r; done; sleep 5; done
+DENY|for i in $(seq 7200); do gh api repos/o/r/actions/runs/1 > "status-$i.json"; sleep 0.1; done
+DENY|for i in $(seq 99); do gh api user >> log-$i; sleep 1; done
+DENY|for i in $(seq 99); do echo "$i $(gh api user)"; sleep 1; done
+DENY|for r in a b c; do gh api repos/me/$r; bash -c 'gh api user'; sleep 1; done
+allow|for r in me/a me/b; do gh pr list --json number --jq '.[] | .number' -R "$r"; sleep 1; done
+allow|for r in me/a me/b; do gh api "repos/$r/pulls" --jq '.[] | select(.draft); .number' > "pr-$r.txt"; sleep 1; done
 DENY:沒有 sleep|while true; do read x; gh api "$x"; done
 DENY|while true; do echo "$(gh run view 1 --json status)"; sleep 5; done
 DENY|while true; do ssh ubuntu "gh api x"; sleep 5; done

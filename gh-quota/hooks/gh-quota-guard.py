@@ -53,6 +53,7 @@ GH_CALL = re.compile(POS + r'(?P<gh>' + GH + r')' + REPO
 FOR_VAR = re.compile(r'for\s+([A-Za-z_]\w*)\s+in\b')
 READ_ARGS = re.compile(r'\bread\b([^;\n]*?)(?:;|\n|\bdo\b)')
 READ_VAR = re.compile(r'(?<![-\w])([A-Za-z_]\w*)\b')
+REDIRECT = re.compile(r'\d*(?:>>?|<)&?\s*' + WORD)
 SLEEP = re.compile(r'\bsleep\s+([^\s;&|)]+)')
 LITERAL = re.compile(r'(\d+(?:\.\d+)?)([smhd]?)')
 UNIT = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
@@ -214,13 +215,19 @@ def batch(cmd, mask, kind, start, end):
         names = READ_VAR.findall(m.group(1)) if m else []
     if not names:
         return False
+    # gh inside a payload (bash -c 'gh api user') can't be tied to the item: not a batch.
+    if any(gh_called(p, code_mask(p), 0, len(p), MAX_DEPTH) for p in payloads(cmd, mask, start, end)):
+        return False
     uses = re.compile(r'\$\{?(?:' + '|'.join(names) + r')\b')
     calls = [m for m in GH_CALL.finditer(cmd, start, end) if mask[m.start('gh')] != QUOTE]
     for m in calls:
-        g = m.start('gh')
-        seg_start = max(cmd.rfind(c, start, g) for c in ';&|\n') + 1
-        seg_end = min([i for i in (cmd.find(c, g, end) for c in ';&|\n') if i >= 0] or [end])
-        if not uses.search(cmd, seg_start, seg_end):
+        # The request itself: its wrapper (ssh $h) through the end of the gh invocation, the
+        # end found outside quotes (--jq '.[] | .n' is one argument), redirections dropped
+        # (> "out-$i" names a file, the request is the same every time).
+        stop = next((k for k in range(m.start('gh'), end)
+                     if cmd[k] in ';&|\n)' and mask[k] == CODE), end)
+        request = REDIRECT.sub(' ', cmd[m.start():stop])
+        if not uses.search(request):
             return False
     return bool(calls)
 
