@@ -57,10 +57,10 @@ import {
   remainingMs,
   rowRatio,
   segments,
-} from './cache.ts'
-import type { Account, Advice, BandPart, BandSeg, CacheEnv, Sample, Ttl } from './cache.ts'
-import { deltaColor, fmtPct, fmtShort, fmtUsd, heat, turnSpend, heatGauge, lineGauge, modelColor, parseGitStatus, parseRateLimit, prettyModel, SCALE, shortAdvice, shortPath, topTools } from './hud.ts'
-import type { GhQuota, ToolTally } from './hud.ts'
+} from './cache'
+import type { Account, Advice, BandPart, BandSeg, CacheEnv, Sample, Ttl } from './cache'
+import { deltaColor, fmtPct, fmtShort, fmtUsd, heat, turnSpend, heatGauge, lineGauge, modelColor, parseGitStatus, parseRateLimit, prettyModel, SCALE, shortAdvice, shortPath, topTools } from './hud'
+import type { GhQuota, ToolTally } from './hud'
 
 const PANE = 'cache'
 const COMMAND = 'cache'
@@ -277,7 +277,7 @@ function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: P
     if (pct === undefined) return []
     const color = heat(pct, scale)
     const reset = pct >= LOUD && resetsAt ? [{ text: ` ↻${fmtShort(resetsAt - now)}`, color: 'gray' }] : []
-    return [part(key, [label(name, pad), ...heatGauge(pct, width, scale), { text: ` ${Math.round(pct)}%`, color, bold: pct >= scale[2] }, ...reset])]
+    return [part(key, [label(name, pad), ...heatGauge(pct, width, scale), { text: ` ${Math.round(pct)}%`, color, bold: pct >= (scale[2] ?? Infinity) }, ...reset])]
   }
   // GitHub's REST quota used, like the plan windows; no token says so instead of showing the anonymous 60
   const gh = (width: number, pad = 0): BandPart[] => {
@@ -544,7 +544,8 @@ export const register: Register = (on, options) => {
     const startedAt = Date.now()
     const r = yield* next(e)
     if (r.usage) {
-      samples.push({
+      const prev = samples[samples.length - 1]
+      const cur: Sample = {
         turnId: e.turnId,
         index: e.index,
         model: r.usage.model || e.model,
@@ -553,7 +554,8 @@ export const register: Register = (on, options) => {
         write: r.usage.cache_creation_input_tokens,
         fresh: r.usage.input_tokens,
         output: r.usage.output_tokens,
-      })
+      }
+      samples.push(cur)
       if (samples.length > KEEP) samples = samples.slice(-KEEP)
       if (!pinned) {
         // the account can change under a session: a subscription running out of plan usage moves to usage credits
@@ -565,7 +567,7 @@ export const register: Register = (on, options) => {
           ttl = baseTtl
           ttlSource = envSource
         }
-        const seen = observeTtl(samples[samples.length - 2], samples[samples.length - 1], observed)
+        const seen = observeTtl(prev, cur, observed)
         if (seen !== observed) {
           observed = seen
           ttl = seen ?? baseTtl

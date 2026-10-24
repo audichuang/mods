@@ -21,9 +21,9 @@ import {
   countMisses,
   sessionHit,
   fitBand,
-} from '../hooks/cache.ts'
-import type { Policy, Sample } from '../hooks/cache.ts'
-import { deltaColor, parseRateLimit, shortAdvice, fmtPct, fmtShort, fmtUsd, gauge, heat, modelColor, turnSpend, heatGauge, HEAT, parseGitStatus, prettyModel, SCALE, shortPath, topTools, TRACK } from '../hooks/hud.ts'
+} from '../hooks/cache'
+import type { Policy, Sample } from '../hooks/cache'
+import { deltaColor, parseRateLimit, shortAdvice, fmtPct, fmtShort, fmtUsd, gauge, heat, modelColor, turnSpend, heatGauge, HEAT, parseGitStatus, prettyModel, SCALE, shortPath, topTools, TRACK } from '../hooks/hud'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -146,7 +146,7 @@ describe('per-turn rows', () => {
     ])
     expect(rows.length).toBe(2)
     expect(rows[0]).toEqual(expect.objectContaining({ turnId: 'a', steps: 2, read: 25, write: 5, fresh: 3 }))
-    expect(rows[1].steps).toBe(1)
+    expect(rows[1]?.steps).toBe(1)
   })
 })
 
@@ -276,12 +276,12 @@ describe('the band', () => {
   test('the turn shows what it spent, the session its total', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     const money = { usd: 1.2 }
-    const limits = [{ kind: 'five_hour', percentUsed: 10 }]
-    fakeEngine(on, {}, calls, undefined, limits, money)
+    const five = { kind: 'five_hour', percentUsed: 10 }
+    fakeEngine(on, {}, calls, undefined, [five], money)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
     await $.turn.start({ text: 'hi', turnId: 't1' } as never)
     money.usd = 1.62
-    limits[0].percentUsed = 10.8
+    five.percentUsed = 10.8
     await step($)
     const ui = await $.ui.mount({ plugin: 'prompt-glance', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 160 } as never })
     expect(await ui.find({ type: 'Text', text: /^Turn $/ })).toBeDefined()
@@ -442,7 +442,7 @@ describe('hud helpers', () => {
   test('tools are ranked by use, MCP names shortened', () => {
     const t = new Map([['Bash', { ok: 18, failed: 1 }], ['mcp__codegraph__codegraph_explore', { ok: 2, failed: 0 }], ['Edit', { ok: 5, failed: 0 }]])
     expect(topTools(t, 2)).toEqual([['Bash', 18, 1], ['Edit', 5, 0]])
-    expect(topTools(t, 3)[2][0]).toBe('codegraph_explore')
+    expect(topTools(t, 3)[2]?.[0]).toBe('codegraph_explore')
   })
 })
 
@@ -458,16 +458,16 @@ describe('heat gauges', () => {
   test('a full strip runs green to red; the rest of the track is grey', () => {
     const full = heatGauge(100, 10, SCALE.window)
     expect(full.map(s => s.text).join('')).toBe('██████████')
-    expect(full[0].color).toBe(HEAT[0])
-    expect(full[full.length - 1].color).toBe(HEAT[4])
+    expect(full[0]?.color).toBe(HEAT[0])
+    expect(full.at(-1)?.color).toBe(HEAT[4])
     const part = heatGauge(30, 10, SCALE.window)
     expect(part.map(s => s.text).join('')).toBe('██████████')
-    expect(part[part.length - 1].color).toBe(TRACK)
+    expect(part.at(-1)?.color).toBe(TRACK)
     // the last filled cell moves by eighths over the track
     const smooth = heatGauge(35, 10, SCALE.window)
     expect(smooth.map(s => s.text).join('')).toBe('███▌██████')
     expect(smooth.find(s => s.text === '▌')?.backgroundColor).toBe(TRACK)
-    expect(heatGauge(1, 10, SCALE.window)[0].text).toBe('▏')
+    expect(heatGauge(1, 10, SCALE.window)[0]?.text).toBe('▏')
   })
 })
 

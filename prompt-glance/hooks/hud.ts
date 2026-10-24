@@ -19,9 +19,8 @@ export const SCALE = {
 
 /** The step's colour for `pct` on `scale`. */
 export function heat(pct: number, scale: readonly number[]): string {
-  let i = 0
-  while (i < scale.length && pct >= scale[i]) i++
-  return HEAT[i]
+  const i = scale.filter(step => pct >= step).length
+  return HEAT[Math.min(i, HEAT.length - 1)] ?? HEAT[0]
 }
 
 /** The empty part of every track. */
@@ -48,7 +47,7 @@ function solidGauge(ratio: number, width: number, colorAt: (p: number) => string
   for (let i = 0; i < width; i++) {
     const color = colorAt(((i + 1) / width) * 100)
     if (i < full) segs.push({ text: '█', color })
-    else if (i === full && frac > 0) segs.push({ text: EIGHTHS[frac], color, backgroundColor: TRACK })
+    else if (i === full && frac > 0) segs.push({ text: EIGHTHS[frac] ?? '', color, backgroundColor: TRACK })
     else segs.push({ text: '█', color: TRACK })
   }
   return merge(segs)
@@ -77,8 +76,9 @@ function merge(segs: BandSeg[]): BandSeg[] {
 /** `git status --porcelain -b`: the branch, whether the tree is dirty, and how far it is from upstream. */
 export function parseGitStatus(stdout: string): { branch: string; dirty: boolean; ahead: number; behind: number } {
   const lines = stdout.split('\n').filter(Boolean)
-  const head = lines[0]?.startsWith('## ') ? lines[0].slice(3) : ''
-  const name = head.startsWith('No commits yet on ') ? head.slice(18) : head.split('...')[0].split(' ')[0]
+  const first = lines[0] ?? ''
+  const head = first.startsWith('## ') ? first.slice(3) : ''
+  const name = head.startsWith('No commits yet on ') ? head.slice(18) : (head.split('...')[0] ?? '').split(' ')[0] ?? ''
   return {
     branch: name === 'HEAD' ? 'detached' : name,
     dirty: lines.length > 1,
@@ -114,15 +114,15 @@ export function fmtShort(ms: number): string {
 
 /** `claude-opus-5-5` (or `claude-opus-5-5[1m]`) as `Opus 5.5`; anything else unchanged. */
 export function prettyModel(id: string): string {
-  const m = /claude-([a-z]+)-(\d+)(?:-(\d+))?/i.exec(id)
-  if (!m) return id
-  const name = m[1][0].toUpperCase() + m[1].slice(1)
-  return m[3] && m[3].length <= 2 ? `${name} ${m[2]}.${m[3]}` : `${name} ${m[2]}`
+  const [, family, major, minor] = /claude-([a-z]+)-(\d+)(?:-(\d+))?/i.exec(id) ?? []
+  if (!family || !major) return id
+  const name = family.charAt(0).toUpperCase() + family.slice(1)
+  return minor && minor.length <= 2 ? `${name} ${major}.${minor}` : `${name} ${major}`
 }
 
 /** Each model family in a calm colour of its own, so a switch shows at a glance. */
 export function modelColor(pretty: string): string {
-  const family = pretty.split(' ')[0].toLowerCase()
+  const family = (pretty.split(' ')[0] ?? '').toLowerCase()
   return ({ opus: '#e0af68', sonnet: '#7aa2f7', haiku: '#9ece6a', fable: '#bb9af7' } as Record<string, string>)[family] ?? '#c0caf5'
 }
 
