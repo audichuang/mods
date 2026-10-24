@@ -92,6 +92,8 @@ export const register: Register = (on, options) => {
       }
     }
 
+    // a reload keeps the entry an earlier version pinned
+    if (!showStatus) $.ui.status(undefined)
     await log('start', e.cwd)
     // Don't hold the session start on a network call.
     void refresh()

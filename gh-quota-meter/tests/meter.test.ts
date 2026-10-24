@@ -89,6 +89,7 @@ test('by default no status entry: the log and the toast still work', async ($, o
   const { files, calls } = engine(on, { exitCode: 0, stdout: '300\t5000\t1761300000\t4900\n' })
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as any)
   await settle(() => calls.toast.length > 0 && (files[FILE] ?? '').includes('\tok\t'))
-  expect(calls.status).toEqual([])
+  // only the clearing of what an earlier version pinned, never a text
+  expect(calls.status).toEqual([undefined])
   expect(files[FILE]).toContain('\twarn\t300/5000')
 })

@@ -420,8 +420,8 @@ export const register: Register = (on, options) => {
   const showBand = options.band !== false
   const showStatus = options.status === true
   const wantToast = options.toast !== false
-  // under the prompt (the PromptHint line) unless pinned above it
-  const below = options.position !== 'above'
+  // above the prompt unless asked for under it: the hint line sits beside the mode pill, so the HUD lands to its right
+  const below = options.position === 'below'
 
   on('session.start', async ($, e, next) => {
     const r = await next(e)
