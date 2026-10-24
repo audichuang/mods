@@ -12,21 +12,30 @@ export const register: Register = on => {
   let gh: string | undefined
 
   on('session.start', async ($, e, next) => {
-    // The first binary that starts at all is the one; run() rejects only when it cannot start.
-    const query = async () => {
-      for (const bin of gh === undefined ? GH : [gh]) {
-        const ran = await $.process.run([bin, 'api', 'rate_limit', '--jq', JQ], { timeoutMs: 15_000 }).catch(() => undefined)
-        if (ran !== undefined) {
-          gh = bin
-          return ran
+    // Nobody sees a status line in -p or SDK runs.
+    if (!e.isInteractive) {
+      return next(e)
+    }
+    // run() rejects both when the binary can't start and when it outlives timeoutMs, so find
+    // gh with an offline `--version` first; a rejected rate_limit call then means a timeout.
+    const findGh = async () => {
+      for (const bin of GH) {
+        const ran = await $.process.run([bin, '--version'], { timeoutMs: 5_000 }).catch(() => undefined)
+        if (ran?.exitCode === 0) {
+          return bin
         }
       }
       return undefined
     }
     const refresh = async () => {
-      const ran = await query()
-      if (ran === undefined) {
+      gh ??= await findGh()
+      if (gh === undefined) {
         $.ui.status('GH 額度：找不到 gh')
+        return
+      }
+      const ran = await $.process.run([gh, 'api', 'rate_limit', '--jq', JQ], { timeoutMs: 15_000 }).catch(() => undefined)
+      if (ran === undefined) {
+        $.ui.status('GH 額度：查詢逾時')
         return
       }
       if (ran.exitCode !== 0) {

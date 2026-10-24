@@ -12,7 +12,8 @@ import sys
 SEP = r'(?:^|[;&|(!\n"\']|\$\(|\b(?:do|then|while|until|if)\b)\s*'
 WRAP = (r'(?:\w+=\S*\s+'
         r'|timeout\s+(?:-\S+\s+(?:\d\S*\s+)?)*\S+\s+'
-        r'|nice\s+(?:-n\s*-?\d+\s+)?|env\s+(?:-u\s+\S+\s+|-\S+\s+)*|stdbuf\s+(?:-\S+\s+)*'
+        r'|nice\s+(?:-n\s*-?\d+\s+|-\d+\s+)?|env\s+(?:-u\s+\S+\s+|-\S+\s+)*'
+        r'|stdbuf\s+(?:-[ioe]\s+\S+\s+|-\S+\s+)*'
         r'|xargs\s+(?:-\S+\s+(?:\d+\s+)?)*'
         r'|ssh\s+[^;&|\n]*?\s'
         r'|(?:nohup|sudo|time|command|exec)\s+)*')
@@ -21,8 +22,10 @@ WATCH = re.compile(POS + r'gh\s+run\s+watch\b')
 CHECKS = re.compile(POS + r'gh\s+pr\s+checks\b[^;&|\n]*--watch')
 # watch(1) re-runs its command forever, every 2 s by default.
 WATCH_CMD = re.compile(POS + r'watch\b[^;&|\n]*\bgh\s')
-# A loop is judged by its own body (keyword .. done), so gh or sleep outside it doesn't count.
-LOOP = re.compile(r'(?:^|[;&|(\n]|\bdo\b|\bthen\b)\s*(while|until|for)\b(.*?)\bdone\b', re.S)
+# Loop keywords and `done` at command position; matched on a copy with quoted text blanked,
+# so `echo "done"` or `x-done` never closes a loop.
+LOOP_KW = re.compile(r'(?:^|[;&|(\n]|\bdo\b|\bthen\b|\belse\b)\s*(while|until|for|done)\b')
+QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
 GH_CALL = re.compile(POS + r'gh\s+(?:api|run|pr)\b')
 SLEEP = re.compile(r'\bsleep\s+(\d+(?:\.\d+)?)([smhd]?)\b')
 UNIT = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
@@ -35,6 +38,21 @@ HINT = ('等 CI 請改用 `gh-wait run <run-id> -R owner/repo` 或 `gh-wait pr <
         '如果是為了等 checks 過了就合併，考慮 `gh pr merge --auto`。')
 
 
+def loops(cmd):
+    """Yield (keyword, text) for each loop, its text running to its own matching `done`
+    (or to the end when unterminated), so nested loops and gh after a loop judge right."""
+    blank = QUOTED.sub(lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[-1], cmd)
+    open_loops = []
+    for m in LOOP_KW.finditer(blank):
+        if m.group(1) != 'done':
+            open_loops.append((m.group(1), m.start(1)))
+        elif open_loops:
+            kind, start = open_loops.pop()
+            yield kind, cmd[start:m.end(1)]
+    for kind, start in open_loops:
+        yield kind, cmd[start:]
+
+
 def reason(cmd):
     if WATCH.search(cmd):
         return '`gh run watch` 每輪打 2 個請求加每個執行中 job 1 個，會吃光共用的 5000/hr GitHub 額度。'
@@ -45,8 +63,7 @@ def reason(cmd):
                 '改用 `gh api <path>`（走帳號的 5000 次）。')
     if WATCH_CMD.search(cmd):
         return '`watch … gh` 會每隔幾秒重跑 gh，會吃光共用的 5000/hr GitHub 額度。'
-    for m in LOOP.finditer(cmd):
-        kind, body = m.group(1), m.group(0)
+    for kind, body in loops(cmd):
         if not GH_CALL.search(body):
             continue
         sleeps = [float(n) * UNIT[u] for n, u in SLEEP.findall(body)]
