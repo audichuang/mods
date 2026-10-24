@@ -161,6 +161,10 @@ let modelId = 'claude-opus-5-5'
 // every command the module ran, and a hook that answers git status in its place (a slow repo)
 let argvs: string[][] = []
 let gitRun: (() => Promise<unknown>) | undefined
+// holds back the next session.usage answer, read when asked, until the promise settles: a reading that lands late
+let usageHold: Promise<unknown> | undefined
+// set once the held answer has gone back to the module
+let usageHeldOut = false
 
 function fakeEngine(
   on: On,
@@ -173,10 +177,21 @@ function fakeEngine(
 ) {
   argvs = []
   gitRun = undefined
+  usageHold = undefined
+  usageHeldOut = false
   ghRate = ''
   modelId = 'claude-opus-5-5'
   ghExit = { exitCode: 0, stderr: '' }
-  on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: limits, ...(money ? { cost: { usd: money.usd } } : {}) } }) as never)
+  on('session.usage', async () => {
+    const value = { startedAt: 0, context: {}, rateLimits: limits, ...(money ? { cost: { usd: money.usd } } : {}) }
+    const hold = usageHold
+    usageHold = undefined
+    if (hold) {
+      await hold
+      usageHeldOut = true
+    }
+    return { value } as never
+  })
   on('turn.start', async ($, e) => ({ turnId: e.turnId }) as never)
   on('session.start', async ($, e) => ({ cwd: e.cwd }) as never)
   on('session.end', async () => ({ sessionId: 's1' }) as never)
@@ -684,13 +699,45 @@ describe('turns and subagents', () => {
     await $.session.start(START)
     await $.turn.start({ text: 'hi', turnId: 't1' } as never)
     money.usd = 1.5
+    // the main loop's first request lands, and with it the $1.50 the turn has spent so far, before the subagent starts
+    await step($)
+    const before = await wide($)
+    await settle(async () => (await before.find({ type: 'Text', text: /^\$1\.50$/ })) !== undefined)
+    expect(await before.find({ type: 'Text', text: /^\$0\.30$/ })).toBeDefined()
+    await before.unmount()
     await $.turn.start({ text: 'go', turnId: 't2', agentId: 'a1' } as never)
     money.usd = 1.62
-    await step($)
+    await step($, { index: 1 })
     const ui = await wide($)
     await settle(async () => (await ui.find({ type: 'Text', text: /^\$1\.62$/ })) !== undefined)
     expect(await ui.find({ type: 'Text', text: /^\$0\.42$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^\$0\.12$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a reading that lands late, across a turn boundary, does not skew the next turn', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const money = { usd: 1.2 }
+    fakeEngine(on, {}, calls, undefined, [], money)
+    await $.session.start(START)
+    await $.turn.start({ text: 'hi', turnId: 't1' } as never)
+    money.usd = 1.5
+    // the reading after the first turn's request is slow: it is still out when the next turn starts
+    let release = () => {}
+    usageHold = new Promise<void>(r => (release = r))
+    await step($)
+    await $.turn.start({ text: 'again', turnId: 't2' } as never)
+    money.usd = 1.62
+    await step($, { turnId: 't2' })
+    // and lands last, with the $1.50 it read: the newer reading stands
+    release()
+    await settle(async () => usageHeldOut)
+    for (let i = 0; i < 50; i++) await Promise.resolve()
+    const ui = await wide($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /^\$1\.62$/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^\$1\.62$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^\$0\.12$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^\$0\.42$/ })).toBeUndefined()
     await ui.unmount()
   })
 })
@@ -708,6 +755,38 @@ describe('a new conversation in the same process', () => {
     expect(await ui.find({ type: 'Text', text: /waiting for first request/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^  hit $/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /^Bash$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('/clear of an expensive conversation: the next turn shows what it spent, not the old total', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const money = { usd: 4.8 }
+    fakeEngine(on, {}, calls, undefined, [], money)
+    await $.session.start(START)
+    await $.turn.start({ text: 'hi', turnId: 't1' } as never)
+    money.usd = 5
+    await step($)
+    const old = await wide($)
+    await settle(async () => (await old.find({ type: 'Text', text: /^\$5\.00$/ })) !== undefined)
+    await old.unmount()
+    // a reading taken as the conversation ends still sees the old $5, and is slow to land
+    let release = () => {}
+    usageHold = new Promise<void>(r => (release = r))
+    await $.session.end(END('clear'))
+    // the new conversation counts from zero, and its first prompt comes before that reading lands
+    money.usd = 0
+    await $.turn.start({ text: 'new', turnId: 't2' } as never)
+    money.usd = 0.2
+    await step($, { turnId: 't2' })
+    release()
+    await settle(async () => usageHeldOut)
+    for (let i = 0; i < 50; i++) await Promise.resolve()
+    const ui = await wide($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /^\$0\.20$/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^Turn $/ })).toBeDefined()
+    // the turn and the session both spent $0.20
+    expect((await ui.findAll({ type: 'Text', text: /^\$0\.20$/ })).length).toBe(2)
+    expect(await ui.find({ type: 'Text', text: /^\$0\.00$/ })).toBeUndefined()
     await ui.unmount()
   })
 
