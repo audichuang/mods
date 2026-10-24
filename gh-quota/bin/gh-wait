@@ -7,6 +7,7 @@
 #   gh-wait pr  <number> [-R owner/repo] [-i seconds] [-t timeout-minutes]
 #
 # Exit: 0 success, 1 finished but failed, 2 usage/API error or timeout (default 120 min).
+# Needs gh and jq.
 set -uo pipefail
 
 usage() { sed -n 's/^#   //p' "$0" >&2; exit 2; }
@@ -23,6 +24,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [[ $interval =~ ^[1-9][0-9]*$ && $timeout =~ ^[1-9][0-9]*$ ]] || usage
+command -v jq >/dev/null || { echo 'gh-wait: jq is required (brew install jq / apt install jq)' >&2; exit 2; }
 [ -n "$repo" ] || repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
 
 case $kind in
@@ -43,24 +45,45 @@ case $kind in
     *) usage ;;
 esac
 
+# hdr <name>: a response header's value (case-insensitive name).
+hdr() {
+    awk -v k="$1" 'NR > 1 && /^\r?$/ {exit}
+        {i = index($0, ":"); if (i && tolower(substr($0, 1, i - 1)) == tolower(k)) {v = substr($0, i + 1); gsub(/^ +|\r/, "", v); print v; exit}}' <<<"$resp"
+}
+errf=$(mktemp) || exit 2
+trap 'rm -f "$errf"' EXIT
 etag='' last='' errors=0 changed=$SECONDS beat=$SECONDS
-deadline=$((SECONDS + timeout * 60))
+# GH_WAIT_MINUTE (seconds per -t minute) only exists so tests can time out quickly.
+deadline=$((SECONDS + timeout * ${GH_WAIT_MINUTE:-60}))
 while :; do
     if [ $SECONDS -ge $deadline ]; then
         echo "$(date +%H:%M:%S) timeout after ${timeout} min, last state: ${last:-unknown}" >&2
         exit 2
     fi
-    resp=$(gh api -i ${etag:+-H "If-None-Match: $etag"} "$path" 2>/dev/null)
-    code=$(head -1 <<<"$resp" | awk '{print $2}')
+    resp=$(gh api -i ${etag:+-H "If-None-Match: $etag"} "$path" 2>"$errf")
+    rc=$?
+    code=$(head -1 <<<"$resp" | awk '{print $2}' | tr -d '\r')
+    err=$(head -3 "$errf" | tr '\r\n' '  ' | sed 's/ *$//')
+    # Primary rate limit used up: wait for the reset (bounded by the deadline), not an error.
+    if [[ $code =~ ^(403|429)$ ]] && [ "$(hdr X-Ratelimit-Remaining)" = 0 ]; then
+        reset=$(hdr X-Ratelimit-Reset)
+        [[ $reset =~ ^[0-9]+$ ]] || reset=$(($(date +%s) + 60))
+        pause=$((reset - $(date +%s) + 1)) left=$((deadline - SECONDS))
+        [ $pause -gt $left ] && pause=$left
+        [ $pause -lt 1 ] && pause=1
+        echo "$(date +%H:%M:%S) rate limit used up, waiting ${pause}s for the reset" >&2
+        sleep $pause
+        continue
+    fi
     case $code in
         304) errors=0 ;;
         401|404|422)
-            echo "$(date +%H:%M:%S) HTTP $code for $path" >&2
+            echo "$(date +%H:%M:%S) HTTP $code for $path${err:+: $err}" >&2
             exit 2
             ;;
         200)
             errors=0
-            etag=$(sed -n 's/^[Ee][Tt]ag: *//p' <<<"$resp" | tr -d '\r' | head -1)
+            etag=$(hdr ETag)
             state=$(awk 'f; /^\r?$/ {f=1}' <<<"$resp" | jq -r "$jq_state") || exit 2
             if [ "$state" != "$last" ]; then
                 echo "$(date +%H:%M:%S) $state"
@@ -78,8 +101,14 @@ while :; do
             esac
             ;;
         *)
+            # No HTTP response at all: gh failed before the request (auth) or on the way (network).
+            if [ -z "$code" ] && { [ $rc -eq 4 ] || grep -qiE 'gh auth login|not logged in' "$errf"; }; then
+                echo "$(date +%H:%M:%S) gh is not logged in: ${err:-gh exited 4}" >&2
+                exit 2
+            fi
             errors=$((errors + 1))
-            echo "$(date +%H:%M:%S) HTTP ${code:-?} (attempt $errors)" >&2
+            what=${code:+HTTP $code}
+            echo "$(date +%H:%M:%S) ${what:-gh api failed} (attempt $errors): ${err:-gh exited $rc}" >&2
             [ $errors -ge 5 ] && exit 2
             sleep $((interval * errors))
             continue
