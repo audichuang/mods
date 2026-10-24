@@ -33,7 +33,7 @@
  *   status: boolean             entry under the prompt (default false)
  *   toast: boolean              toasts near expiry: at warnSeconds, then 10, 3, 2 and 1 s (default true)
  */
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, ResolveInput } from 'claude-code'
 import {
   advise,
   COUNTDOWN_MARKS,
@@ -59,8 +59,8 @@ import {
   segments,
 } from './cache.ts'
 import type { Account, Advice, BandPart, BandSeg, CacheEnv, Sample, Ttl } from './cache.ts'
-import { deltaColor, fmtPct, fmtShort, fmtUsd, heat, turnSpend, heatGauge, lineGauge, modelColor, parseGitStatus, prettyModel, SCALE, shortAdvice, shortPath, topTools } from './hud.ts'
-import type { ToolTally } from './hud.ts'
+import { deltaColor, fmtPct, fmtShort, fmtUsd, heat, turnSpend, heatGauge, lineGauge, modelColor, parseGitStatus, parseRateLimit, prettyModel, SCALE, shortAdvice, shortPath, topTools } from './hud.ts'
+import type { GhQuota, ToolTally } from './hud.ts'
 
 const PANE = 'cache'
 const COMMAND = 'cache'
@@ -100,6 +100,17 @@ let tally: ToolTally = new Map()
 // skills the main loop loaded, by name, and how often
 let skills = new Map<string, number>()
 let branchReadAt = 0
+// the account's GitHub REST quota; rate_limit itself costs none of it
+let ghQuota: GhQuota | undefined
+let ghBin: string | null | undefined
+const GH_EVERY_TICKS = 120
+const GH_JQ = '[.resources.core.remaining, .resources.core.limit, .resources.core.reset] | @tsv'
+// $.process.run takes no shell, and the Claude process's PATH may lack Homebrew's bin
+const GH_PATHS = ['gh', '/opt/homebrew/bin/gh', '/home/linuxbrew/.linuxbrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'] as const
+// one line per change of why the HUD is or isn't drawn, newest HUD_LOG_MAX kept
+const HUD_LOG = '.local/state/prompt-glance/hud.log'
+const HUD_LOG_MAX = 500
+let lastNote = ''
 // a plan window's reset time shows only from here up
 const LOUD = 50
 // cells between the band's parts: room to breathe
@@ -123,6 +134,34 @@ async function refreshInfo($: EngineInterface, withBranch = false) {
     const r = await $.process.run(['git', 'status', '--porcelain', '-b']).catch(() => undefined)
     git = r && r.exitCode === 0 ? parseGitStatus(r.stdout) : undefined
   }
+}
+
+async function refreshGh($: EngineInterface) {
+  if (ghBin === undefined) {
+    ghBin = null
+    for (const bin of GH_PATHS) {
+      const ran = await $.process.run([bin, '--version'], { timeoutMs: 5_000 }).catch(() => undefined)
+      if (ran?.exitCode === 0) {
+        ghBin = bin
+        break
+      }
+    }
+  }
+  if (ghBin === null) return
+  const ran = await $.process.run([ghBin, 'api', 'rate_limit', '--jq', GH_JQ], { timeoutMs: 15_000 }).catch(() => undefined)
+  // a failed or timed-out check keeps the last reading rather than blanking the gauge
+  const quota = ran?.exitCode === 0 ? parseRateLimit(ran.stdout) : undefined
+  if (quota) ghQuota = quota
+}
+
+/** Appends `event` to hud.log when it differs from the last line written; never throws. */
+async function note($: EngineInterface, event: string) {
+  if (event === lastNote || home === undefined) return
+  lastNote = event
+  const path = `${home}/${HUD_LOG}`
+  const before = await $.fs.read(path).catch(() => '')
+  const kept = [...before.split('\n').filter(l => l !== ''), `${new Date().toISOString()}\t${event}`].slice(-HUD_LOG_MAX)
+  await $.fs.write(path, kept.join('\n') + '\n').catch(() => undefined)
 }
 
 type Policy = { warnMs: number; compactAtTokens: number }
@@ -181,6 +220,198 @@ async function readSetting($: EngineInterface): Promise<unknown> {
   return undefined
 }
 
+// The HUD's rows for a site `columns` wide, built from that site's element table.
+function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: Policy) {
+  const now = Date.now()
+  const { last, advice, left } = current(policy, now)
+  const { Box, Text } = $.ui.resolve(e)
+  const part = (key: string, segs: BandSeg[]): BandPart => ({ key, text: segs.map(g => g.text).join(''), segs })
+  const label = (text: string, pad = 0): BandSeg => ({ text: `${text.padEnd(pad)} `, color: 'gray' })
+
+  // row one, left: who and where
+  const who = part('model', [{ text: model || 'Claude', color: modelColor(model), bold: true }])
+  const where = (levels?: number) => part('path', [{ text: shortPath(cwd, home, levels), color: 'blue' }])
+  const branch: BandPart[] = git
+    ? [
+        part('git', [
+          { text: 'git:(', color: 'gray' },
+          { text: git.branch, color: 'cyan' },
+          ...(git.dirty ? [{ text: '*', color: 'yellow', bold: true }] : []),
+          { text: ')', color: 'gray' },
+          ...(git.ahead ? [{ text: ` ↑${git.ahead}`, color: 'green' }] : []),
+          ...(git.behind ? [{ text: ` ↓${git.behind}`, color: 'red' }] : []),
+        ]),
+      ]
+    : []
+
+  // row one, right: the cache, its hit rate and how long it stays warm
+  const state = shortAdvice(advice, last ? fmtTokens(promptTokens(last)) : undefined)
+  // the session's hit rate and misses: the last request alone sits near 100% in any long conversation
+  const sessionHitRatio = sessionHit(samples)
+  const misses = countMisses(samples, ttl)
+  const ratio = sessionHitRatio
+  const counting = !!last && advice.kind !== 'uncached' && advice.kind !== 'off'
+  const lifeC = counting ? (left > 0 ? lifeColor(left, ttl, policy.warnMs) : 'red') : undefined
+  const hitC = ratio >= 0.8 ? 'green' : ratio >= 0.4 ? 'yellow' : 'red'
+  // ● Cache 1h ████████████ 59m  hit 76%  misses 1   (the dot and the bar drain green, yellow, red; ○ cold once lapsed)
+  const cache = (width: number, words = true, pad = 0): BandPart[] => {
+    const lapsed = advice.kind === 'expired'
+    const dot: BandSeg = counting && !lapsed ? { text: '● ', color: lifeC } : { text: '○ ', color: lapsed ? 'red' : 'gray' }
+    const segs: BandSeg[] = [dot, label('Cache', pad)]
+    if (lapsed) segs.push({ text: 'cold', color: 'red', bold: true })
+    else if (counting) {
+      segs.push({ text: `${ttl} `, color: lifeC })
+      if (width > 0) segs.push(...lineGauge(lifeRatio(left, ttl), width, lifeC), { text: ' ' })
+      segs.push({ text: fmtShort(left), color: lifeC, bold: true })
+    }
+    if (last) {
+      segs.push({ text: '  hit ', color: 'gray' }, { text: fmtPct(sessionHitRatio), color: hitC, bold: true })
+      if (misses > 0) segs.push({ text: '  misses ', color: 'gray' }, { text: String(misses), color: misses > 2 ? 'red' : 'yellow', bold: true })
+    }
+    if (state.text && (words || !last)) segs.push({ text: `  ${state.text}`, color: COLOR[advice.kind] ?? 'gray', bold: advice.kind !== 'cold' })
+    return [part('cache', segs)]
+  }
+
+  // row two, left: the context window and the plan windows
+  const meter = (key: string, name: string, pct: number | undefined, width: number, scale: readonly number[], resetsAt?: number, pad = 0): BandPart[] => {
+    if (pct === undefined) return []
+    const color = heat(pct, scale)
+    const reset = pct >= LOUD && resetsAt ? [{ text: ` ↻${fmtShort(resetsAt - now)}`, color: 'gray' }] : []
+    return [part(key, [label(name, pad), ...heatGauge(pct, width, scale), { text: ` ${Math.round(pct)}%`, color, bold: pct >= scale[2] }, ...reset])]
+  }
+  // GitHub's REST quota used, like the plan windows; no token says so instead of showing the anonymous 60
+  const gh = (width: number, pad = 0): BandPart[] => {
+    if (!ghQuota) return []
+    if (ghQuota.anon) return [part('gh', [label('GH', pad), { text: '未登入', color: 'gray' }])]
+    return meter('gh', 'GH', ghQuota.pct, width, SCALE.window, ghQuota.resetsAt, pad)
+  }
+  const gauges = (width: number, withWeek = true) => [
+    ...meter('ctx', 'Context', ctxPct, width, SCALE.context),
+    ...meter('5h', '5h', five?.pct, width, SCALE.window, five?.resetsAt),
+    ...(withWeek ? meter('7d', 'Week', week?.pct, width, SCALE.window, week?.resetsAt) : []),
+    ...gh(width),
+  ]
+
+  // row two, right: the tools the main loop ran
+  // the activity: tools by use (skills apart), then the skills by name
+  const toolsOnly: ToolTally = new Map([...tally].filter(([name]) => name !== 'Skill'))
+  const tools = (n: number, pad = 0): BandPart[] => {
+    const list = topTools(toolsOnly, n)
+    if (list.length === 0) return []
+    const failed = [...toolsOnly.values()].reduce((sum, c) => sum + c.failed, 0)
+    return [
+      part('tools', [
+        label('Tools', pad),
+        ...list.flatMap(([name, ok, bad], i) => [{ text: `${i ? '  ' : ''}${name}` }, { text: `×${ok + bad}`, color: 'gray' }]),
+        ...(failed > 0 ? [{ text: `  ✗${failed}`, color: 'red', bold: true }] : []),
+      ]),
+    ]
+  }
+  const skillList = (n: number, pad = 0): BandPart[] => {
+    const list = [...skills].sort((a, b) => b[1] - a[1]).slice(0, n)
+    if (list.length === 0) return []
+    return [
+      part('skills', [
+        label('Skills', pad),
+        ...list.flatMap(([name, count], i) => [{ text: `${i ? '  ' : ''}${name}`, color: 'magenta' }, ...(count > 1 ? [{ text: `×${count}`, color: 'gray' }] : [])]),
+        ...(skills.size > n ? [{ text: `  +${skills.size - n}`, color: 'gray' }] : []),
+      ]),
+    ]
+  }
+  // as many tools and skills as fit, each on a row of its own
+  const activityRows = (pad: number): [BandPart[], BandPart[]][] => {
+    const out: [BandPart[], BandPart[]][] = []
+    for (const make of [tools, skillList]) {
+      const fit = [6, 4, 3, 2, 1].map(n => make(n, pad)).find(p => p.length === 0 || fitsRow([p, []], columns))
+      if (fit && fit.length) out.push([fit, []])
+    }
+    return out
+  }
+
+  // what the current (or last) turn spent: dollars, and its share of the 5-hour window; the session's total beside it
+  const spent = turnSpend(turnBase, costUsd, five?.pct, week?.pct)
+  const spend = (withSession: boolean, pad = 0): BandPart[] => {
+    if (!spent) return []
+    const segs: BandSeg[] = [label('Turn', pad)]
+    if (spent.usd !== undefined) segs.push({ text: fmtUsd(spent.usd), color: '#c0caf5', bold: true })
+    if (spent.five !== undefined) segs.push({ text: `${segs.length > 1 ? ' ' : ''}+${spent.five.toFixed(1)}%`, color: deltaColor(spent.five) })
+    if (segs.length === 1) return []
+    if (withSession && costUsd !== undefined) segs.push({ text: '  ' }, label('Session'), { text: fmtUsd(costUsd), color: 'gray' })
+    return [part('spend', segs)]
+  }
+
+  // wide: two rows, a left and a right group each, when nothing has to go
+  const wideTop: [BandPart[], BandPart[]][] = [
+    [[who, where(), ...branch], [...spend(true), ...cache(12)]],
+    [[who, where(3), ...branch], [...spend(true), ...cache(12)]],
+    [[who, where(1), ...branch], [...spend(false), ...cache(12)]],
+    [[who, where(1), ...branch], [...spend(false), ...cache(10)]],
+    [[who, where(1), ...branch], cache(10)],
+  ]
+  // the activity rides at the right of the gauges when it fits there whole, else takes rows of its own
+  const activity = [...tools(4), ...skillList(2)]
+  const wideBottom: [BandPart[], BandPart[]][] = [
+    [gauges(12), activity],
+    [gauges(12), []],
+    [gauges(10), activity],
+    [gauges(10), []],
+  ]
+  let rows: [BandPart[], BandPart[]][]
+  const top = wideTop.find(v => fitsRow(v, columns))
+  const bottom = wideBottom.find(v => fitsRow(v, columns))
+  if (top && bottom) {
+    rows = [top, bottom]
+    if (bottom[1].length === 0) rows.push(...activityRows(0))
+  } else {
+    // narrow: stack instead of dropping, labels padded so the gauges line up
+    rows = []
+    const head = [[who, where(), ...branch], [who, where(3), ...branch], [who, where(1), ...branch]].find(l => fitsRow([l, []], columns))
+    if (head) rows.push([head, []])
+    else rows.push([[who], []], [[where(1), ...branch], []])
+    const pad = LABEL_PAD
+    const cacheRow = [cache(12, true, pad), cache(10, true, pad), cache(8, true, pad), cache(6, false, pad)].find(c => fitsRow([c, []], columns)) ?? cache(0, false, pad)
+    rows.push([cacheRow, []])
+    const spendRow = [spend(true, pad), spend(false, pad)].find(p => p.length && fitsRow([p, []], columns))
+    if (spendRow) rows.push([spendRow, []])
+    const width = [12, 10, 8].find(w => fitsRow([meter('ctx', 'Context', 100, w, SCALE.context, undefined, pad), []], columns)) ?? 6
+    let line: BandPart[] = []
+    for (const g of [
+      ...meter('ctx', 'Context', ctxPct, width, SCALE.context, undefined, pad),
+      ...meter('5h', '5h', five?.pct, width, SCALE.window, five?.resetsAt, pad),
+      ...meter('7d', 'Week', week?.pct, width, SCALE.window, week?.resetsAt, pad),
+      ...gh(width, pad),
+    ]) {
+      if (line.length && !fitsRow([[...line, g], []], columns)) {
+        rows.push([line, []])
+        line = []
+      }
+      line.push(g)
+    }
+    if (line.length) rows.push([line, []])
+    // too narrow for the activity: the essentials only, with room around them
+  }
+
+  const group = (key: string, parts: BandPart[]) => (
+    <Box key={key} flexDirection="row" columnGap={GAP} flexShrink={0}>
+      {parts.map(p => (
+        <Box key={p.key} flexDirection="row" flexShrink={0}>
+          {(p.segs ?? [{ text: p.text, color: p.color }]).map((g, j) => (
+            <Text key={`${p.key}:${j}`} color={g.color} backgroundColor={g.backgroundColor} bold={g.bold} dimColor={g.dim}>{g.text}</Text>
+          ))}
+        </Box>
+      ))}
+    </Box>
+  )
+  const row = (key: string, [l, r]: [BandPart[], BandPart[]]) => (
+    <Box key={key} flexDirection="row" flexWrap="nowrap">
+      {group(`${key}:l`, l)}
+      {r.length ? <Box key={`${key}:gap`} flexGrow={1} minWidth={GAP} /> : null}
+      {r.length ? group(`${key}:r`, r) : null}
+    </Box>
+  )
+  return { Box, Text, rows: rows.map((r, i) => row(`row${i}`, r)) }
+}
+
 export const register: Register = (on, options) => {
   const policy: Policy = {
     warnMs: positive(options.warnSeconds, 60) * 1000,
@@ -189,6 +420,8 @@ export const register: Register = (on, options) => {
   const showBand = options.band !== false
   const showStatus = options.status === true
   const wantToast = options.toast !== false
+  // under the prompt (the PromptHint line) unless pinned above it
+  const below = options.position !== 'above'
 
   on('session.start', async ($, e, next) => {
     const r = await next(e)
@@ -230,10 +463,13 @@ export const register: Register = (on, options) => {
     tally = new Map()
     skills = new Map()
     await refreshInfo($, true)
+    void note($, `start ${e.isInteractive ? 'interactive' : 'headless'} ${below ? 'below' : 'above'}`)
+    if (e.isInteractive) void refreshGh($).then(() => $.ui.invalidate('ui.render'))
 
     let ticks = 0
     timer?.cancel()
     timer = $.clock.every(1000, () => {
+      if (e.isInteractive && ticks % GH_EVERY_TICKS === GH_EVERY_TICKS - 1) void refreshGh($).then(() => $.ui.invalidate('ui.render'))
       if (++ticks % 5 === 0) void refreshInfo($).then(() => $.ui.invalidate('ui.render'))
       // the model every second: a /model switch shows at once, not on the next request
       else
@@ -274,6 +510,7 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', async ($, e, next) => {
+    void note($, `end ${e.reason}`)
     // /clear starts a new conversation in the same process: its cache is a new one
     if (e.reason === 'clear') {
       samples = []
@@ -391,189 +628,42 @@ export const register: Register = (on, options) => {
   // Labels are plain words; each gauge is a thin track that warms from green to red along its length.
   // When the row is short, the richest variant that fits wins, so it never wraps.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!showBand || e.props.hasSurvey || isPaneOpen) return next(e)
-    const now = Date.now()
-    const { last, advice, left } = current(policy, now)
-    const { Box, Text } = $.ui.resolve(e)
-    // the band's own width, not the terminal's: the engine keeps five cells at the right end
-    const columns = e.props.bodyColumns ?? (e.viewport?.columns ?? 100) - 5
-    const part = (key: string, segs: BandSeg[]): BandPart => ({ key, text: segs.map(g => g.text).join(''), segs })
-    const label = (text: string, pad = 0): BandSeg => ({ text: `${text.padEnd(pad)} `, color: 'gray' })
-
-    // row one, left: who and where
-    const who = part('model', [{ text: model || 'Claude', color: modelColor(model), bold: true }])
-    const where = (levels?: number) => part('path', [{ text: shortPath(cwd, home, levels), color: 'blue' }])
-    const branch: BandPart[] = git
-      ? [
-          part('git', [
-            { text: 'git:(', color: 'gray' },
-            { text: git.branch, color: 'cyan' },
-            ...(git.dirty ? [{ text: '*', color: 'yellow', bold: true }] : []),
-            { text: ')', color: 'gray' },
-            ...(git.ahead ? [{ text: ` ↑${git.ahead}`, color: 'green' }] : []),
-            ...(git.behind ? [{ text: ` ↓${git.behind}`, color: 'red' }] : []),
-          ]),
-        ]
-      : []
-
-    // row one, right: the cache, its hit rate and how long it stays warm
-    const state = shortAdvice(advice, last ? fmtTokens(promptTokens(last)) : undefined)
-    // the session's hit rate and misses: the last request alone sits near 100% in any long conversation
-    const sessionHitRatio = sessionHit(samples)
-    const misses = countMisses(samples, ttl)
-    const ratio = sessionHitRatio
-    const counting = !!last && advice.kind !== 'uncached' && advice.kind !== 'off'
-    const lifeC = counting ? (left > 0 ? lifeColor(left, ttl, policy.warnMs) : 'red') : undefined
-    const hitC = ratio >= 0.8 ? 'green' : ratio >= 0.4 ? 'yellow' : 'red'
-    // ● Cache 1h ████████████ 59m  hit 76%  misses 1   (the dot and the bar drain green, yellow, red; ○ cold once lapsed)
-    const cache = (width: number, words = true, pad = 0): BandPart[] => {
-      const lapsed = advice.kind === 'expired'
-      const dot: BandSeg = counting && !lapsed ? { text: '● ', color: lifeC } : { text: '○ ', color: lapsed ? 'red' : 'gray' }
-      const segs: BandSeg[] = [dot, label('Cache', pad)]
-      if (lapsed) segs.push({ text: 'cold', color: 'red', bold: true })
-      else if (counting) {
-        segs.push({ text: `${ttl} `, color: lifeC })
-        if (width > 0) segs.push(...lineGauge(lifeRatio(left, ttl), width, lifeC), { text: ' ' })
-        segs.push({ text: fmtShort(left), color: lifeC, bold: true })
-      }
-      if (last) {
-        segs.push({ text: '  hit ', color: 'gray' }, { text: fmtPct(sessionHitRatio), color: hitC, bold: true })
-        if (misses > 0) segs.push({ text: '  misses ', color: 'gray' }, { text: String(misses), color: misses > 2 ? 'red' : 'yellow', bold: true })
-      }
-      if (state.text && (words || !last)) segs.push({ text: `  ${state.text}`, color: COLOR[advice.kind] ?? 'gray', bold: advice.kind !== 'cold' })
-      return [part('cache', segs)]
+    const yieldTo = !showBand ? 'off' : below ? undefined : e.props.hasSurvey ? 'survey' : isPaneOpen ? 'pane' : undefined
+    if (!showBand || below || e.props.hasSurvey || isPaneOpen) {
+      if (yieldTo) void note($, `above yields: ${yieldTo}`)
+      return next(e)
     }
+    try {
+      // the band's own width, not the terminal's: the engine keeps five cells at the right end
+      const { Box, rows } = drawHud($, e, e.props.bodyColumns ?? (e.viewport?.columns ?? 100) - 5, policy)
+      void note($, 'above drawn')
+      return <Box flexDirection="column">{rows}</Box>
+    } catch (err) {
+      void note($, `above error: ${String(err).slice(0, 200)}`)
+      return next(e)
+    }
+  })
 
-    // row two, left: the context window and the plan windows
-    const meter = (key: string, name: string, pct: number | undefined, width: number, scale: readonly number[], resetsAt?: number, pad = 0): BandPart[] => {
-      if (pct === undefined) return []
-      const color = heat(pct, scale)
-      const reset = pct >= LOUD && resetsAt ? [{ text: ` ↻${fmtShort(resetsAt - now)}`, color: 'gray' }] : []
-      return [part(key, [label(name, pad), ...heatGauge(pct, width, scale), { text: ` ${Math.round(pct)}%`, color, bold: pct >= scale[2] }, ...reset])]
+  // Under the prompt: the HUD, then the engine's own hint line (bypass mode, esc to interrupt) as dim text.
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    if (!showBand || !below || isPaneOpen) {
+      if (below && showBand) void note($, 'below yields: pane')
+      return next(e)
     }
-    const gauges = (width: number, withWeek = true) => [
-      ...meter('ctx', 'Context', ctxPct, width, SCALE.context),
-      ...meter('5h', '5h', five?.pct, width, SCALE.window, five?.resetsAt),
-      ...(withWeek ? meter('7d', 'Week', week?.pct, width, SCALE.window, week?.resetsAt) : []),
-    ]
-
-    // row two, right: the tools the main loop ran
-    // the activity: tools by use (skills apart), then the skills by name
-    const toolsOnly: ToolTally = new Map([...tally].filter(([name]) => name !== 'Skill'))
-    const tools = (n: number, pad = 0): BandPart[] => {
-      const list = topTools(toolsOnly, n)
-      if (list.length === 0) return []
-      const failed = [...toolsOnly.values()].reduce((sum, c) => sum + c.failed, 0)
-      return [
-        part('tools', [
-          label('Tools', pad),
-          ...list.flatMap(([name, ok, bad], i) => [{ text: `${i ? '  ' : ''}${name}` }, { text: `×${ok + bad}`, color: 'gray' }]),
-          ...(failed > 0 ? [{ text: `  ✗${failed}`, color: 'red', bold: true }] : []),
-        ]),
-      ]
+    try {
+      const { Box, Text, rows } = drawHud($, e, (e.viewport?.columns ?? 100) - 4, policy)
+      const hint = [e.props.hint, e.props.tail].filter(Boolean).join(' ')
+      void note($, 'below drawn')
+      return (
+        <Box flexDirection="column">
+          {rows}
+          {hint ? <Text key="hint" dimColor>{hint}</Text> : null}
+        </Box>
+      )
+    } catch (err) {
+      void note($, `below error: ${String(err).slice(0, 200)}`)
+      return next(e)
     }
-    const skillList = (n: number, pad = 0): BandPart[] => {
-      const list = [...skills].sort((a, b) => b[1] - a[1]).slice(0, n)
-      if (list.length === 0) return []
-      return [
-        part('skills', [
-          label('Skills', pad),
-          ...list.flatMap(([name, count], i) => [{ text: `${i ? '  ' : ''}${name}`, color: 'magenta' }, ...(count > 1 ? [{ text: `×${count}`, color: 'gray' }] : [])]),
-          ...(skills.size > n ? [{ text: `  +${skills.size - n}`, color: 'gray' }] : []),
-        ]),
-      ]
-    }
-    // as many tools and skills as fit, each on a row of its own
-    const activityRows = (pad: number): [BandPart[], BandPart[]][] => {
-      const out: [BandPart[], BandPart[]][] = []
-      for (const make of [tools, skillList]) {
-        const fit = [6, 4, 3, 2, 1].map(n => make(n, pad)).find(p => p.length === 0 || fitsRow([p, []], columns))
-        if (fit && fit.length) out.push([fit, []])
-      }
-      return out
-    }
-
-    // what the current (or last) turn spent: dollars, and its share of the 5-hour window; the session's total beside it
-    const spent = turnSpend(turnBase, costUsd, five?.pct, week?.pct)
-    const spend = (withSession: boolean, pad = 0): BandPart[] => {
-      if (!spent) return []
-      const segs: BandSeg[] = [label('Turn', pad)]
-      if (spent.usd !== undefined) segs.push({ text: fmtUsd(spent.usd), color: '#c0caf5', bold: true })
-      if (spent.five !== undefined) segs.push({ text: `${segs.length > 1 ? ' ' : ''}+${spent.five.toFixed(1)}%`, color: deltaColor(spent.five) })
-      if (segs.length === 1) return []
-      if (withSession && costUsd !== undefined) segs.push({ text: '  ' }, label('Session'), { text: fmtUsd(costUsd), color: 'gray' })
-      return [part('spend', segs)]
-    }
-
-    // wide: two rows, a left and a right group each, when nothing has to go
-    const wideTop: [BandPart[], BandPart[]][] = [
-      [[who, where(), ...branch], [...spend(true), ...cache(12)]],
-      [[who, where(3), ...branch], [...spend(true), ...cache(12)]],
-      [[who, where(1), ...branch], [...spend(false), ...cache(12)]],
-      [[who, where(1), ...branch], [...spend(false), ...cache(10)]],
-      [[who, where(1), ...branch], cache(10)],
-    ]
-    // the activity rides at the right of the gauges when it fits there whole, else takes rows of its own
-    const activity = [...tools(4), ...skillList(2)]
-    const wideBottom: [BandPart[], BandPart[]][] = [
-      [gauges(12), activity],
-      [gauges(12), []],
-      [gauges(10), activity],
-      [gauges(10), []],
-    ]
-    let rows: [BandPart[], BandPart[]][]
-    const top = wideTop.find(v => fitsRow(v, columns))
-    const bottom = wideBottom.find(v => fitsRow(v, columns))
-    if (top && bottom) {
-      rows = [top, bottom]
-      if (bottom[1].length === 0) rows.push(...activityRows(0))
-    } else {
-      // narrow: stack instead of dropping, labels padded so the gauges line up
-      rows = []
-      const head = [[who, where(), ...branch], [who, where(3), ...branch], [who, where(1), ...branch]].find(l => fitsRow([l, []], columns))
-      if (head) rows.push([head, []])
-      else rows.push([[who], []], [[where(1), ...branch], []])
-      const pad = LABEL_PAD
-      const cacheRow = [cache(12, true, pad), cache(10, true, pad), cache(8, true, pad), cache(6, false, pad)].find(c => fitsRow([c, []], columns)) ?? cache(0, false, pad)
-      rows.push([cacheRow, []])
-      const spendRow = [spend(true, pad), spend(false, pad)].find(p => p.length && fitsRow([p, []], columns))
-      if (spendRow) rows.push([spendRow, []])
-      const width = [12, 10, 8].find(w => fitsRow([meter('ctx', 'Context', 100, w, SCALE.context, undefined, pad), []], columns)) ?? 6
-      let line: BandPart[] = []
-      for (const g of [
-        ...meter('ctx', 'Context', ctxPct, width, SCALE.context, undefined, pad),
-        ...meter('5h', '5h', five?.pct, width, SCALE.window, five?.resetsAt, pad),
-        ...meter('7d', 'Week', week?.pct, width, SCALE.window, week?.resetsAt, pad),
-      ]) {
-        if (line.length && !fitsRow([[...line, g], []], columns)) {
-          rows.push([line, []])
-          line = []
-        }
-        line.push(g)
-      }
-      if (line.length) rows.push([line, []])
-      // too narrow for the activity: the essentials only, with room around them
-    }
-
-    const group = (key: string, parts: BandPart[]) => (
-      <Box key={key} flexDirection="row" columnGap={GAP} flexShrink={0}>
-        {parts.map(p => (
-          <Box key={p.key} flexDirection="row" flexShrink={0}>
-            {(p.segs ?? [{ text: p.text, color: p.color }]).map((g, j) => (
-              <Text key={`${p.key}:${j}`} color={g.color} backgroundColor={g.backgroundColor} bold={g.bold} dimColor={g.dim}>{g.text}</Text>
-            ))}
-          </Box>
-        ))}
-      </Box>
-    )
-    const row = (key: string, [l, r]: [BandPart[], BandPart[]]) => (
-      <Box key={key} flexDirection="row" flexWrap="nowrap">
-        {group(`${key}:l`, l)}
-        {r.length ? <Box key={`${key}:gap`} flexGrow={1} minWidth={GAP} /> : null}
-        {r.length ? group(`${key}:r`, r) : null}
-      </Box>
-    )
-    return <Box flexDirection="column">{rows.map((r, i) => row(`row${i}`, r))}</Box>
   })
 
   on('ui.render', { component: 'Pane' }, async ($, e, next) => {

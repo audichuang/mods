@@ -42,7 +42,7 @@ async function settle(until: () => boolean) {
   for (let i = 0; i < 5000 && !until(); i++) await Promise.resolve()
 }
 
-test('interactive session: status shows the quota, log has start then ok', async ($, on) => {
+test('interactive session: status shows the quota, log has start then ok', { options: { status: true } }, async ($, on) => {
   const { files, calls } = engine(on, { exitCode: 0, stdout: '4200\t5000\t1761300000\t4900\n' })
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as any)
   await settle(() => calls.status.length > 0 && (files[FILE] ?? '').includes('\tok\t'))
@@ -61,7 +61,7 @@ test('low quota: one toast and a warn line', async ($, on) => {
   expect(files[FILE]).toContain('\twarn\t300/5000')
 })
 
-test('anonymous quota: says not logged in, no toast', async ($, on) => {
+test('anonymous quota: says not logged in, no toast', { options: { status: true } }, async ($, on) => {
   const { files, calls } = engine(on, { exitCode: 0, stdout: '55\t60\t1761300000\t0\n' })
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as any)
   await settle(() => (files[FILE] ?? '').includes('\tanon\t'))
@@ -70,7 +70,7 @@ test('anonymous quota: says not logged in, no toast', async ($, on) => {
   expect((files[FILE] ?? '').trim().split('\n').map(l => l.split('\t')[1])).toEqual(['start', 'anon'])
 })
 
-test('timeout is told apart from a failed call', async ($, on) => {
+test('timeout is told apart from a failed call', { options: { status: true } }, async ($, on) => {
   const { files, calls } = engine(on, 'reject')
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as any)
   await settle(() => (files[FILE] ?? '').includes('\ttimeout\t'))
@@ -83,4 +83,12 @@ test('non-interactive session: no polling, no log', async ($, on) => {
   await settle(() => false)
   expect(calls.every).toBe(0)
   expect(files).toEqual({})
+})
+
+test('by default no status entry: the log and the toast still work', async ($, on) => {
+  const { files, calls } = engine(on, { exitCode: 0, stdout: '300\t5000\t1761300000\t4900\n' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as any)
+  await settle(() => calls.toast.length > 0 && (files[FILE] ?? '').includes('\tok\t'))
+  expect(calls.status).toEqual([])
+  expect(files[FILE]).toContain('\twarn\t300/5000')
 })

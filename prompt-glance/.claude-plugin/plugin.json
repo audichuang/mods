@@ -1,7 +1,7 @@
 {
   "name": "prompt-glance",
-  "version": "0.1.0",
-  "description": "A two-row HUD above the Claude Code prompt: model, path and git branch, context and plan-window gauges that warm from green to red, prompt-cache hit rate with a live countdown to expiry, and the tools and skills in use. Folds to fewer rows on a narrow terminal. /cache opens a per-turn cache table.",
+  "version": "0.2.0",
+  "description": "A two-row HUD under the Claude Code prompt (or above it): model, path and git branch, context, plan-window and GitHub API quota gauges that warm from green to red, prompt-cache hit rate with a live countdown to expiry, and the tools and skills in use. Folds to fewer rows on a narrow terminal. /cache opens a per-turn cache table.",
   "author": {
     "name": "audichuang",
     "url": "https://github.com/audichuang"
@@ -26,6 +26,16 @@
         "auto",
         "5m",
         "1h"
+      ]
+    },
+    "position": {
+      "type": "string",
+      "title": "HUD position",
+      "description": "below draws the HUD under the prompt, in place of the hint line (the hint follows it as dim text); above draws it in the band over the prompt",
+      "default": "below",
+      "options": [
+        "below",
+        "above"
       ]
     },
     "warnSeconds": {

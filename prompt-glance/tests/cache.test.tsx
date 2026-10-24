@@ -23,7 +23,7 @@ import {
   fitBand,
 } from '../hooks/cache.ts'
 import type { Policy, Sample } from '../hooks/cache.ts'
-import { deltaColor, shortAdvice, fmtPct, fmtShort, fmtUsd, gauge, heat, modelColor, turnSpend, heatGauge, HEAT, parseGitStatus, prettyModel, SCALE, shortPath, topTools, TRACK } from '../hooks/hud.ts'
+import { deltaColor, parseRateLimit, shortAdvice, fmtPct, fmtShort, fmtUsd, gauge, heat, modelColor, turnSpend, heatGauge, HEAT, parseGitStatus, prettyModel, SCALE, shortPath, topTools, TRACK } from '../hooks/hud.ts'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -153,6 +153,8 @@ describe('per-turn rows', () => {
 // The module end to end: a main-loop request feeds the band, a subagent's does not.
 type Calls = { status: (string | undefined)[]; logs: string[] }
 
+let ghRate = ''
+
 function fakeEngine(on: On, env: Record<string, string>, calls: Calls, cache = { read: 80_000, write: 1_000 }, limits: { kind: string; percentUsed: number; resetsAt?: string }[] = [], money?: { usd: number }) {
   on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: limits, ...(money ? { cost: { usd: money.usd } } : {}) } }) as never)
   on('turn.start', async ($, e) => ({ turnId: e.turnId }) as never)
@@ -160,7 +162,11 @@ function fakeEngine(on: On, env: Record<string, string>, calls: Calls, cache = {
   on('session.end', async () => ({ sessionId: 's1' }) as never)
   on('env.get', ($, e) => ({ value: env[e.name] }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }) as never)
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '## main...origin/main [ahead 1]\n M hooks/x.ts\n', stderr: '' } }) as never)
+  // gh's rate_limit answers ghRate (nothing parseable by default); git status and gh --version the branch
+  on('process.run', ($, e) => {
+    const stdout = (e as { argv: string[] }).argv[1] === 'api' ? ghRate : '## main...origin/main [ahead 1]\n M hooks/x.ts\n'
+    return { value: { exitCode: 0, stdout, stderr: '' } } as never
+  })
   on('command.register', () => ({ value: undefined }) as never)
   on('clock.every', () => ({ value: undefined }) as never)
   on('ui.open', () => ({ value: undefined }) as never)
@@ -199,7 +205,7 @@ const BAND = { hasSurvey: false } as never
 const band = ($: Engine) => $.ui.mount({ plugin: 'prompt-glance', surface: 'terminal', component: 'AbovePrompt', props: BAND })
 
 describe('the band', () => {
-  test('shows nothing before the first request, then the hit rate and the countdown', { options: { status: true } }, async ($, on) => {
+  test('shows nothing before the first request, then the hit rate and the countdown', { options: { position: 'above', status: true } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
@@ -219,7 +225,7 @@ describe('the band', () => {
     expect(calls.status.at(-1)).toMatch(/^cache 98% · [45]:\d\d$/)
   })
 
-  test('a subagent request is not the main loop and leaves the meter alone', { options: { status: true } }, async ($, on) => {
+  test('a subagent request is not the main loop and leaves the meter alone', { options: { position: 'above', status: true } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
@@ -229,7 +235,7 @@ describe('the band', () => {
     expect(calls.status.filter(t => t?.includes('%')).length).toBe(1)
   })
 
-  test('a narrow band stacks its groups instead of dropping them', async ($, on) => {
+  test('a narrow band stacks its groups instead of dropping them', { options: { position: 'above' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls, undefined, [
       { kind: 'five_hour', percentUsed: 9 },
@@ -246,7 +252,7 @@ describe('the band', () => {
     await ui.unmount()
   })
 
-  test('tools and skills show by name and count when wide; a narrow band leaves them out', async ($, on) => {
+  test('tools and skills show by name and count when wide; a narrow band leaves them out', { options: { position: 'above' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls)
     on('tool.call', async () => ({ result: 'ok' }) as never)
@@ -267,7 +273,7 @@ describe('the band', () => {
     await narrow.unmount()
   })
 
-  test('the turn shows what it spent, the session its total', async ($, on) => {
+  test('the turn shows what it spent, the session its total', { options: { position: 'above' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     const money = { usd: 1.2 }
     const limits = [{ kind: 'five_hour', percentUsed: 10 }]
@@ -285,7 +291,7 @@ describe('the band', () => {
     await ui.unmount()
   })
 
-  test('a plan window always shows its percentage, its reset only past half', async ($, on) => {
+  test('a plan window always shows its percentage, its reset only past half', { options: { position: 'above' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls, undefined, [
       { kind: 'five_hour', percentUsed: 72, resetsAt: new Date(Date.now() + 3 * 3600_000).toISOString() },
@@ -301,7 +307,7 @@ describe('the band', () => {
     await ui.unmount()
   })
 
-  test('ENABLE_PROMPT_CACHING_1H makes the lifetime an hour; the option beats the environment', async ($, on) => {
+  test('ENABLE_PROMPT_CACHING_1H makes the lifetime an hour; the option beats the environment', { options: { position: 'above' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { ENABLE_PROMPT_CACHING_1H: '1' }, calls)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
@@ -312,28 +318,28 @@ describe('the band', () => {
     await ui.unmount()
   })
 
-  test('a Claude subscription defaults to an hour, usage credits to five minutes', async ($, on) => {
+  test('a Claude subscription defaults to an hour, usage credits to five minutes', { options: { position: 'above' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls, undefined, [{ kind: 'five_hour', percentUsed: 12 }])
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
     expect(calls.logs.join('\n')).toContain('1h cache (Claude subscription default)')
   })
 
-  test('CLAUDE_CODE_PROMPT_CACHE_TTL beats the subscription default', async ($, on) => {
+  test('CLAUDE_CODE_PROMPT_CACHE_TTL beats the subscription default', { options: { position: 'above' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }, calls, undefined, [{ kind: 'five_hour', percentUsed: 12 }])
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
     expect(calls.logs.join('\n')).toContain('5m cache (CLAUDE_CODE_PROMPT_CACHE_TTL)')
   })
 
-  test('the ttl option beats the environment', { options: { ttl: '5m' } }, async ($, on) => {
+  test('the ttl option beats the environment', { options: { position: 'above', ttl: '5m' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { ENABLE_PROMPT_CACHING_1H: '1' }, calls)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
     expect(calls.logs.join('\n')).toContain('5m cache (the ttl option)')
   })
 
-  test('a request that touched no cache shows no countdown', async ($, on) => {
+  test('a request that touched no cache shows no countdown', { options: { position: 'above' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls, { read: 0, write: 0 })
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
@@ -344,7 +350,7 @@ describe('the band', () => {
     await ui.unmount()
   })
 
-  test('DISABLE_PROMPT_CACHING says so instead of a countdown', async ($, on) => {
+  test('DISABLE_PROMPT_CACHING says so instead of a countdown', { options: { position: 'above' } }, async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { DISABLE_PROMPT_CACHING: '1' }, calls)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
@@ -542,5 +548,76 @@ describe('which lifetime Claude Code asks for', () => {
     expect(accountOf([{ kind: 'spend_limit', percentUsed: 10 }])).toBe('other')
     expect(accountOf([{ kind: 'five_hour', percentUsed: 20 }, { kind: 'seven_day', percentUsed: 5 }])).toBe('subscription')
     expect(accountOf([{ kind: 'five_hour', percentUsed: 100 }])).toBe('credits')
+  })
+})
+
+describe('the GitHub quota', () => {
+  test('parses remaining, limit and reset; the anonymous 60 is no account quota', () => {
+    expect(parseRateLimit('4000\t5000\t1761300000\n')).toEqual({ anon: false, pct: 20, resetsAt: 1761300000000 })
+    expect(parseRateLimit('55\t60\t1761300000')).toEqual({ anon: true })
+    expect(parseRateLimit('')).toBeUndefined()
+    expect(parseRateLimit('x\t5000\t1')).toBeUndefined()
+    expect(parseRateLimit('1\t2')).toBeUndefined()
+  })
+})
+
+async function settle(until: () => Promise<boolean>) {
+  for (let i = 0; i < 2000 && !(await until()); i++) await Promise.resolve()
+}
+
+const HINT = ($: Engine) =>
+  $.ui.mount({ plugin: 'prompt-glance', surface: 'terminal', component: 'PromptHint', props: { isDraft: false, isWorking: false, hint: 'bypass permissions on' } as never, viewport: { columns: 160, rows: 40 } } as never)
+
+describe('under the prompt', () => {
+  test('by default the HUD draws under the prompt with the hint after it, and the band above stays the engine\'s', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    ghRate = '4000\t5000\t1761300000\n'
+    fakeEngine(on, {}, calls)
+    // stands for the engine's own band above the prompt
+    on('ui.render', ($, e) => {
+      const { Text } = $.ui.resolve(e)
+      return <Text>engine band</Text>
+    })
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await step($)
+    const ui = await HINT($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /^GH/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^bypass permissions on$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^ 20%$/ })).toBeDefined()
+    await ui.unmount()
+    const above = await band($)
+    expect(await above.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeUndefined()
+    expect(await above.find({ type: 'Text', text: /^engine band$/ })).toBeDefined()
+    await above.unmount()
+  })
+
+  test('no token: GH says not logged in instead of a percentage', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    ghRate = '55\t60\t1761300000\n'
+    fakeEngine(on, {}, calls)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await step($)
+    const ui = await HINT($)
+    await settle(async () => (await ui.find({ type: 'Text', text: /未登入/ })) !== undefined)
+    expect(await ui.find({ type: 'Text', text: /^未登入$/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('position above leaves the hint line to the engine', { options: { position: 'above' } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    ghRate = ''
+    fakeEngine(on, {}, calls)
+    // stands for the engine's own hint line
+    on('ui.render', ($, e) => {
+      const { Text } = $.ui.resolve(e)
+      return <Text>engine hint</Text>
+    })
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await step($)
+    const ui = await HINT($)
+    expect(await ui.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^engine hint$/ })).toBeDefined()
+    await ui.unmount()
   })
 })

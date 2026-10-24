@@ -200,3 +200,19 @@ export function turnSpend(
     week: base.week === undefined && week === undefined ? undefined : grow(base.week, week),
   }
 }
+
+/** The REST quota as the HUD shows it: the share used, or anon when gh has no usable token. */
+export type GhQuota = { anon: false; pct: number; resetsAt: number } | { anon: true }
+
+/** Without a token (an SSH session can't reach the macOS keychain) the API hands out the anonymous 60. */
+const ANON_LIMIT = 60
+
+/** Parses `gh api rate_limit --jq` output of `remaining<TAB>limit<TAB>reset`; undefined when it is not that. */
+export function parseRateLimit(stdout: string): GhQuota | undefined {
+  const fields = stdout.trim().split('\t')
+  if (fields.length !== 3 || fields.includes('')) return undefined
+  const [remaining, limit, reset] = fields.map(Number)
+  if (remaining === undefined || limit === undefined || reset === undefined || [remaining, limit, reset].some(Number.isNaN) || limit <= 0) return undefined
+  if (limit <= ANON_LIMIT) return { anon: true }
+  return { anon: false, pct: ((limit - remaining) / limit) * 100, resetsAt: reset * 1000 }
+}

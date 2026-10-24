@@ -14,7 +14,9 @@ const LOG_MAX = 500
 
 type Kind = 'ok' | 'anon' | 'no-gh' | 'timeout' | 'fail' | 'bad-output'
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  // prompt-glance draws the quota in its HUD; the engine's status entry is opt-in
+  const showStatus = options.status === true
   let warnedForReset = 0
   let gh: string | undefined
   let lastKind: Kind | undefined
@@ -83,7 +85,7 @@ export const register: Register = on => {
 
     const refresh = async () => {
       const state = await check()
-      $.ui.status(state.text)
+      if (showStatus) $.ui.status(state.text)
       if (state.kind !== lastKind) {
         lastKind = state.kind
         await log(state.kind, state.detail)
