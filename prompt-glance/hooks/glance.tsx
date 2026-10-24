@@ -97,6 +97,9 @@ let ctxPct: number | undefined
 // what the session has cost so far, and the figures at the start of the current turn, so the turn's share shows
 let costUsd: number | undefined
 let turnBase: { usd?: number; five?: number; week?: number } | undefined
+// each usage read is numbered; one answered after a newer one has landed is dropped, so a slow read cannot undo it
+let usageAsked = 0
+let usageApplied = 0
 let five: Window | undefined
 let week: Window | undefined
 let tally: ToolTally = new Map()
@@ -131,8 +134,16 @@ const GAP = 2
  */
 async function refreshInfo($: EngineInterface, withBranch = false) {
   readGit($, withBranch)
+  await readUsage($)
+  model = prettyModel(await $.session.model().catch(() => model))
+}
+
+/** Cost, context and the plan windows, off the engine (no git): quick enough for turn.start to wait on. */
+async function readUsage($: EngineInterface) {
+  const n = ++usageAsked
   const u = await $.session.usage().catch(() => undefined)
-  if (u) {
+  if (u && n > usageApplied) {
+    usageApplied = n
     ctxPct = u.context.percent
     costUsd = u.cost?.usd
     const win = (kind: string): Window | undefined => {
@@ -144,7 +155,6 @@ async function refreshInfo($: EngineInterface, withBranch = false) {
     // the account can change under a session: a subscription running out of plan usage moves to usage credits
     account = accountOf(u.rateLimits)
   }
-  model = prettyModel(await $.session.model().catch(() => model))
 }
 
 function readGit($: EngineInterface, force: boolean) {
@@ -199,6 +209,9 @@ function newConversation() {
   skills = new Map()
   turnNo = new Map()
   turnBase = undefined
+  // the old conversation's cost is not this one's, and neither is a reading still on its way
+  costUsd = undefined
+  usageApplied = usageAsked
 }
 
 async function refreshGh($: EngineInterface) {
@@ -581,12 +594,15 @@ export const register: Register = (on, options) => {
     void note($, `end ${e.reason}`)
     // /clear and a resume carry on in this process with another conversation, and another cache: start over, and
     // keep the clock (no session.start follows). An exit, a logout or the end of a -p run takes the clock with the process.
-    if (e.reason !== 'prompt_input_exit' && e.reason !== 'logout' && e.reason !== 'other') {
+    const fresh = e.reason !== 'prompt_input_exit' && e.reason !== 'logout' && e.reason !== 'other'
+    if (fresh) {
       newConversation()
-      void refresh($)
       $.ui.invalidate('ui.render')
     }
-    return next(e)
+    const r = await next(e)
+    // read once the engine is done with the old conversation
+    if (fresh) void refresh($)
+    return r
   })
 
   // each main-loop request: what the cache did with it
@@ -594,8 +610,10 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     // a subagent's turn runs inside the main one, whose baseline stays
     if (e.agentId !== undefined) return next(e)
+    // a reading taken now, not the cached one: that may predate the last turn's spending or a /clear.
+    // Only the engine's usage call is awaited; git stays in the background
+    await readUsage($)
     const r = await next(e)
-    // the latest reading: what the last turn ended on, since nothing spends between turns
     turnBase = { usd: costUsd, five: five?.pct, week: week?.pct }
     void refresh($)
     $.ui.invalidate('ui.render')
