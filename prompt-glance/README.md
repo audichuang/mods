@@ -3,8 +3,8 @@
 A two-row HUD for Claude Code, drawn right above the prompt. One glance tells you which model you are on, where you are, how full the context and your plan windows are, whether the prompt cache is still warm, and what Claude has been doing.
 
 ```
-Opus 5.5  ~/Project/app  git:(main*) ↑1      Turn $0.42 +0.8%  Session $3.10   Cache 99.6%  ████████████ 58m
-Context ███▌████████ 22%   5h █▎██████████ 10%   Week ▌███████████ 4%      Tools Bash×20  Edit×3  Skills tdd
+Opus 5.5  ~/Project/app  git:(main*) ↑1      Turn $0.42 +0.8%  Session $3.10  ● Cache 1h ████████████ 58m  hit 99.6%  misses 1
+Context ███▌████████ 22%   5h █▎██████████ 10%   Week ▌███████████ 4%   GH ██▍█████████ 20%      Tools Bash×20  Edit×3  Skills tdd
 ```
 
 It is a Claude Code **mod** (a plugin of function hooks), not a status line command: it redraws every second from the engine's own figures, so the cache countdown is live and a `/model` switch shows at once.
@@ -17,11 +17,11 @@ It is a Claude Code **mod** (a plugin of function hooks), not a status line comm
 - **Path**, with `~` for home, shortened from the left when the row is tight.
 - **Git**, as `git:(branch)`: a yellow `*` when the tree is dirty, `↑n` / `↓n` against upstream.
 - **Turn** and **Session**: what the current turn has spent so far (from the prompt you sent to the end of the answer, every request and tool call in between) and its share of the 5-hour window (`+0.8%`: grey under 1%, yellow to 3%, red past it), then the session's total. The figures stay after the turn ends until you send the next prompt.
-- **Cache**: the last request's hit rate (99.5% never rounds up to 100%) and a bar that drains as the cache's lifetime runs out, with the time left. Words appear only when there is something to do: `expiring · send a message`, `expired · /compact first`, `missed`.
+- **Cache**: a dot, the lifetime in use (`5m` or `1h`), a bar that drains as it runs out and the time left, all green, then yellow, then red as it lapses; once it has lapsed, `○ Cache cold`. Then `hit`, the session's hit rate (every main-loop request's cache reads over all its prompt tokens; the last request alone sits near 100% in any long conversation, and 99.5% never rounds up to 100%), and `misses n` when some requests wrote the prefix again instead of reading it. Words appear only when there is something to do: `expiring · send a message`; once lapsed, `next message re-caches 82k tokens`, with `· /compact first` on a large context; `missed`; `not cached`; `caching off`; and `waiting for first request` before the first one.
 
 **Row two: how much is used, then the activity**
 
-- **Context**, **5h** and **Week** as solid bars that warm from green to red along their length; the last cell fills by eighths, so the bar moves smoothly. The percentage takes the colour of its level, and a plan window past 50% also shows when it resets (`↻3h`).
+- **Context**, **5h**, **Week** and **GH** as solid bars that warm from green to red along their length; the last cell fills by eighths, so the bar moves smoothly. The percentage takes the colour of its level, and a plan window past 50% also shows when it resets (`↻3h`).
 
   | Level | green | lime | yellow | orange | red |
   | --- | --- | --- | --- | --- | --- |
@@ -29,16 +29,17 @@ It is a Claude Code **mod** (a plugin of function hooks), not a status line comm
   | 5h / Week | < 40% | 40-60% | 60-75% | 75-90% | ≥ 90% |
 
   The context window turns sooner: a fuller context degrades answers and nears auto-compact well before a plan window runs out.
+- **GH** is the share of the account's GitHub REST quota used (5000 an hour), read with `gh api rate_limit` every two minutes in an interactive session (that call costs none of the quota). `未登入` when gh has no token (never logged in, or the anonymous 60 an SSH session without the keychain gets). When a check fails the last reading stays with a grey `?`, and goes once its hour has reset. No gh, no GH gauge.
 - **Tools** the main loop ran, most used first (MCP tools by their last name segment), with a red `✗n` when some failed; **Skills** loaded, by name.
 
 **On a narrow terminal** the two rows fold into a stack with aligned labels, and the activity is left out so the essentials keep room around them:
 
 ```
 Opus 5.5  ~/Project/app
-Cache    99.6%  ████████████ 58m
-Turn     $0.42 +0.8%  Session $3.10
-Context  ███▌████████ 22%
-5h       █▎██████████ 10%    Week  ▌███████████ 4%
+● Cache   1h ████████████ 58m  hit 99.6%
+Turn    $0.42 +0.8%  Session $3.10
+Context ███▌████████ 22%
+5h      █▎██████████ 10%  Week    ▌███████████ 4%
 ```
 
 ### What the dollars count
@@ -89,11 +90,13 @@ Other switches read from the environment at session start:
 
 ## What it hooks
 
-- `turn.start`: notes the session's cost and the plan windows, so the turn's share can show
+- `turn.start`: notes the session's cost and the plan windows as last read, so the turn's share can show (the main loop's turns only: a subagent's runs inside one)
 - `turn.step`: each main-loop request's cache usage (subagents have their own prefixes and are left out)
 - `tool.call`: counts tools and skills, and whether a call failed
-- `$.clock.every(1000)`: the countdown and the model; context and plan windows are re-read every 5 seconds, git status every 30
-- `ui.render` on `AbovePrompt` (the HUD) and on `Pane` (`/cache`)
+- `session.end`: a `/clear` or a resume starts the meter, the `/cache` table and the activity over, and the clock runs on
+- `$.clock.every(1000)`: the countdown and the model; context and plan windows are re-read every 5 seconds, git status every 30, the GitHub quota every 2 minutes
+- `$.process.run`: `git --no-optional-locks status --porcelain -b` (so it never takes the index lock from your own git commands) and `gh api rate_limit`, both in the background: no hook waits on them, the HUD draws the last reading and redraws when a new one lands
+- `ui.render` on `AbovePrompt` (the HUD), on `PromptHint` (the HUD under the prompt, with `position: below`) and on `Pane` (`/cache`); the HUD gives way to a survey and to the open `/cache` pane
 - `$.ui.toast`: at the warning threshold (60 s by default) and at 10, 3, 2 and 1 seconds left, for prompts of 20k tokens or more
 
 ## Install
@@ -101,28 +104,27 @@ Other switches read from the environment at session start:
 Requires Claude Code 2.1.287 or later (mods on by default).
 
 ```
-/plugin install prompt-glance --marketplace audichuang/mods
+/plugin marketplace add audichuang/mods
+/plugin install prompt-glance@audi-mods
 ```
 
-Claude Code auto-loads it as `prompt-glance@skills-dir` in every session. To try it for one session instead: `claude --plugin-dir /path/to/prompt-glance`.
+It loads as `prompt-glance@audi-mods` in every session. To try it for one session instead: `claude --plugin-dir /path/to/prompt-glance`.
 
 It does not replace your `statusLine` setting; if you used a status line for the same figures, remove it from `~/.claude/settings.json` to avoid showing them twice.
 
-```sh
-claude plugin validate ~/.claude/skills/prompt-glance   # every event it hooks, every $ call it makes
-claude plugin test ~/.claude/skills/prompt-glance       # its tests
-```
+To check a change, run the repository's gate from its root: `bash scripts/check.sh` validates every plugin (`claude plugin validate --strict`), runs this mod's tests (`claude plugin test prompt-glance`) and type-checks it.
 
 ## Options
 
-Read from user settings (`~/.claude/settings.json`), `--settings <file>` or managed settings:
+Set them in the `/plugin` menu (prompt-glance's options), or in user settings (`~/.claude/settings.json`), `--settings <file>` or managed settings:
 
 ```json
-{ "pluginConfigs": { "prompt-glance@skills-dir": { "options": { "ttl": "auto" } } } }
+{ "pluginConfigs": { "prompt-glance@audi-mods": { "options": { "ttl": "auto" } } } }
 ```
 
 ```
   ttl: string               "auto" | "5m" | "1h" (default auto)
+  position: string          "above" | "below": the band over the prompt, or the hint line under it, right of the mode label (default above)
   warnSeconds: number       countdown threshold for the warning state and the first toast (default 60)
   compactAtTokens: number   prompt size from which an expired cache suggests /compact (default 100000)
   band: boolean             the HUD above the prompt (default true)
