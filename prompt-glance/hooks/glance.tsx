@@ -25,8 +25,9 @@
  *
  * Needs Claude Code >= 2.1.287.
  *
- * Options (pluginConfigs["prompt-glance@skills-dir"].options):
+ * Options (the /plugin menu, or pluginConfigs["prompt-glance@audi-mods"].options):
  *   ttl: "auto" | "5m" | "1h"   cache lifetime (default auto)
+ *   position: "above" | "below" the band over the prompt, or the hint line under it (default above)
  *   warnSeconds: number         countdown threshold for the warning (default 60)
  *   compactAtTokens: number     prompt size that makes an expired cache suggest /compact (default 100000)
  *   band: boolean               row above the prompt (default true)
@@ -57,10 +58,10 @@ import {
   remainingMs,
   rowRatio,
   segments,
-} from './cache.ts'
-import type { Account, Advice, BandPart, BandSeg, CacheEnv, Sample, Ttl } from './cache.ts'
-import { deltaColor, fmtPct, fmtShort, fmtUsd, heat, turnSpend, heatGauge, lineGauge, modelColor, parseGitStatus, parseRateLimit, prettyModel, SCALE, shortAdvice, shortPath, topTools } from './hud.ts'
-import type { GhQuota, ToolTally } from './hud.ts'
+} from './cache'
+import type { Account, Advice, BandPart, BandSeg, CacheEnv, Sample, Ttl } from './cache'
+import { deltaColor, fmtPct, fmtShort, fmtUsd, heat, turnSpend, heatGauge, lineGauge, modelColor, parseGitStatus, parseRateLimit, prettyModel, SCALE, shortAdvice, shortPath, topTools } from './hud'
+import type { GhQuota, ToolTally } from './hud'
 
 const PANE = 'cache'
 const COMMAND = 'cache'
@@ -72,6 +73,8 @@ let samples: Sample[] = []
 let ttl: Ttl = '5m'
 let baseTtl: Ttl = '5m'
 let pinned = false
+// the ttl option, as the config menu set it
+let ttlOption: unknown
 let observed: Ttl | undefined
 let setting: unknown
 let account: Account = 'other'
@@ -99,9 +102,14 @@ let week: Window | undefined
 let tally: ToolTally = new Map()
 // skills the main loop loaded, by name, and how often
 let skills = new Map<string, number>()
+// each turn's number in the conversation, counted apart from the samples, which keep only the last KEEP
+let turnNo = new Map<string, number>()
 let branchReadAt = 0
+let gitBusy = false
 // the account's GitHub REST quota; rate_limit itself costs none of it
 let ghQuota: GhQuota | undefined
+// the last check failed: the reading on show is an old one
+let ghStale = false
 let ghBin: string | null | undefined
 const GH_EVERY_TICKS = 120
 const GH_JQ = '[.resources.core.remaining, .resources.core.limit, .resources.core.reset] | @tsv'
@@ -116,7 +124,13 @@ const LOUD = 50
 // cells between the band's parts: room to breathe
 const GAP = 2
 
+/**
+ * Re-reads the session's figures. No hook awaits it: the HUD draws the latest
+ * reading and redraws when a new one lands. git status runs apart, one at a
+ * time, so a slow or locked repo holds back neither a hook nor the other figures.
+ */
 async function refreshInfo($: EngineInterface, withBranch = false) {
+  readGit($, withBranch)
   const u = await $.session.usage().catch(() => undefined)
   if (u) {
     ctxPct = u.context.percent
@@ -127,13 +141,64 @@ async function refreshInfo($: EngineInterface, withBranch = false) {
     }
     five = win('five_hour')
     week = win('seven_day')
+    // the account can change under a session: a subscription running out of plan usage moves to usage credits
+    account = accountOf(u.rateLimits)
   }
   model = prettyModel(await $.session.model().catch(() => model))
-  if (withBranch || Date.now() - branchReadAt > 30_000) {
-    branchReadAt = Date.now()
-    const r = await $.process.run(['git', 'status', '--porcelain', '-b']).catch(() => undefined)
-    git = r && r.exitCode === 0 ? parseGitStatus(r.stdout) : undefined
+}
+
+function readGit($: EngineInterface, force: boolean) {
+  if (gitBusy || (!force && Date.now() - branchReadAt <= 30_000)) return
+  gitBusy = true
+  branchReadAt = Date.now()
+  // --no-optional-locks: a status run in the background must not take index.lock from the agent's own git commands
+  void $.process
+    .run(['git', '--no-optional-locks', 'status', '--porcelain', '-b'], { timeoutMs: 10_000 })
+    .then(
+      r => {
+        git = r.exitCode === 0 ? parseGitStatus(r.stdout) : undefined
+        $.ui.invalidate('ui.render')
+      },
+      // timed out or could not start: the branch last read stays
+      () => undefined,
+    )
+    .finally(() => {
+      gitBusy = false
+    })
+}
+
+/** Which lifetime Claude Code asks for now, from the option, the environment, the setting and the account. */
+function retune() {
+  const choice = decideTtl(ttlOption, env, setting, account)
+  baseTtl = choice.ttl
+  envSource = choice.source
+  if (observed === undefined) {
+    ttl = baseTtl
+    ttlSource = envSource
   }
+}
+
+/** The session's figures re-read in the background, then redrawn: no hook waits on them. */
+function refresh($: EngineInterface, withBranch = false): Promise<void> {
+  return refreshInfo($, withBranch).then(() => {
+    retune()
+    $.ui.invalidate('ui.render')
+  })
+}
+
+/** A conversation of its own: its cache, its requests, its turns and its activity start over. */
+function newConversation() {
+  samples = []
+  lastKey = ''
+  toastedFor = 0
+  toastLevel = Infinity
+  observed = undefined
+  ttl = baseTtl
+  ttlSource = envSource
+  tally = new Map()
+  skills = new Map()
+  turnNo = new Map()
+  turnBase = undefined
 }
 
 async function refreshGh($: EngineInterface) {
@@ -149,9 +214,17 @@ async function refreshGh($: EngineInterface) {
   }
   if (ghBin === null) return
   const ran = await $.process.run([ghBin, 'api', 'rate_limit', '--jq', GH_JQ], { timeoutMs: 15_000 }).catch(() => undefined)
-  // a failed or timed-out check keeps the last reading rather than blanking the gauge
-  const quota = ran?.exitCode === 0 ? parseRateLimit(ran.stdout) : undefined
-  if (quota) ghQuota = quota
+  // exit 4, or gh asking for `gh auth login`: no token at all, which the gauge says as it does for the anonymous 60
+  const noLogin = ran !== undefined && (ran.exitCode === 4 || /gh auth login/.test(`${ran.stdout}\n${ran.stderr}`))
+  const quota: GhQuota | undefined = ran?.exitCode === 0 ? parseRateLimit(ran.stdout) : noLogin ? { anon: true } : undefined
+  if (quota) {
+    ghQuota = quota
+    ghStale = false
+  } else if (ghQuota) {
+    // a failed or timed-out check keeps the last reading, marked as old, until its window resets
+    ghStale = true
+    if (!ghQuota.anon && Date.now() >= ghQuota.resetsAt) ghQuota = undefined
+  }
 }
 
 /** Appends `event` to hud.log when it differs from the last line written; never throws. */
@@ -277,13 +350,16 @@ function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: P
     if (pct === undefined) return []
     const color = heat(pct, scale)
     const reset = pct >= LOUD && resetsAt ? [{ text: ` ↻${fmtShort(resetsAt - now)}`, color: 'gray' }] : []
-    return [part(key, [label(name, pad), ...heatGauge(pct, width, scale), { text: ` ${Math.round(pct)}%`, color, bold: pct >= scale[2] }, ...reset])]
+    return [part(key, [label(name, pad), ...heatGauge(pct, width, scale), { text: ` ${Math.round(pct)}%`, color, bold: pct >= (scale[2] ?? Infinity) }, ...reset])]
   }
   // GitHub's REST quota used, like the plan windows; no token says so instead of showing the anonymous 60
+  // an old reading (the last check failed) carries a grey ?, and says nothing once its window has reset
   const gh = (width: number, pad = 0): BandPart[] => {
     if (!ghQuota) return []
     if (ghQuota.anon) return [part('gh', [label('GH', pad), { text: '未登入', color: 'gray' }])]
-    return meter('gh', 'GH', ghQuota.pct, width, SCALE.window, ghQuota.resetsAt, pad)
+    if (!ghStale) return meter('gh', 'GH', ghQuota.pct, width, SCALE.window, ghQuota.resetsAt, pad)
+    if (now >= ghQuota.resetsAt) return []
+    return meter('gh', 'GH', ghQuota.pct, width, SCALE.window, undefined, pad).map(p => part(p.key, [...(p.segs ?? []), { text: ' ?', color: 'gray' }]))
   }
   const gauges = (width: number, withWeek = true) => [
     ...meter('ctx', 'Context', ctxPct, width, SCALE.context),
@@ -423,11 +499,11 @@ export const register: Register = (on, options) => {
   // above the prompt unless asked for under it: the hint line sits beside the mode pill, so the HUD lands to its right
   const below = options.position === 'below'
 
+  ttlOption = options.ttl
+
   on('session.start', async ($, e, next) => {
     const r = await next(e)
-    samples = []
-    lastKey = ''
-    toastedFor = 0
+    newConversation()
     const none = () => undefined
     env = {
       enable1h: await $.env.get('ENABLE_PROMPT_CACHING_1H').catch(none),
@@ -439,14 +515,8 @@ export const register: Register = (on, options) => {
       disableOpus: await $.env.get('DISABLE_PROMPT_CACHING_OPUS').catch(none),
     }
     pinned = options.ttl === '5m' || options.ttl === '1h'
-    observed = undefined
     setting = await readSetting($)
-    account = accountOf((await $.session.usage().catch(() => undefined))?.rateLimits ?? [])
-    const choice = decideTtl(options.ttl, env, setting, account)
-    baseTtl = choice.ttl
-    ttl = baseTtl
-    envSource = choice.source
-    ttlSource = envSource
+    retune()
 
     await $.command
       .register({
@@ -456,13 +526,11 @@ export const register: Register = (on, options) => {
         immediate: true,
       })
       .catch(err => $.ui.log(`prompt-glance: /${COMMAND} not registered: ${err}`))
-    $.ui.log(`prompt-glance loaded: ${ttl} cache (${ttlSource}), /${COMMAND} opens the table`, { to: 'debug' })
 
     cwd = e.cwd
     home = await $.env.get('HOME').catch(() => undefined)
-    tally = new Map()
-    skills = new Map()
-    await refreshInfo($, true)
+    // the account (and with it the lifetime) is known once the first reading lands
+    void refresh($, true).then(() => $.ui.log(`prompt-glance loaded: ${ttl} cache (${ttlSource}), /${COMMAND} opens the table`, { to: 'debug' }))
     void note($, `start ${e.isInteractive ? 'interactive' : 'headless'} ${below ? 'below' : 'above'}`)
     if (e.isInteractive) void refreshGh($).then(() => $.ui.invalidate('ui.render'))
 
@@ -470,7 +538,7 @@ export const register: Register = (on, options) => {
     timer?.cancel()
     timer = $.clock.every(1000, () => {
       if (e.isInteractive && ticks % GH_EVERY_TICKS === GH_EVERY_TICKS - 1) void refreshGh($).then(() => $.ui.invalidate('ui.render'))
-      if (++ticks % 5 === 0) void refreshInfo($).then(() => $.ui.invalidate('ui.render'))
+      if (++ticks % 5 === 0) void refresh($)
       // the model every second: a /model switch shows at once, not on the next request
       else
         void $.session
@@ -511,40 +579,36 @@ export const register: Register = (on, options) => {
 
   on('session.end', async ($, e, next) => {
     void note($, `end ${e.reason}`)
-    // /clear starts a new conversation in the same process: its cache is a new one
-    if (e.reason === 'clear') {
-      samples = []
-      lastKey = ''
-      toastedFor = 0
-      observed = undefined
-      ttl = baseTtl
-      ttlSource = envSource
-      tally = new Map()
-      skills = new Map()
+    // /clear and a resume carry on in this process with another conversation, and another cache: start over, and
+    // keep the clock (no session.start follows). An exit, a logout or the end of a -p run takes the clock with the process.
+    if (e.reason !== 'prompt_input_exit' && e.reason !== 'logout' && e.reason !== 'other') {
+      newConversation()
+      void refresh($)
       $.ui.invalidate('ui.render')
-      return next(e)
     }
-    timer?.cancel()
-    timer = undefined
     return next(e)
   })
 
   // each main-loop request: what the cache did with it
   // a new turn: remember where cost and the plan windows stand, so the HUD can show what this turn spends
   on('turn.start', async ($, e, next) => {
+    // a subagent's turn runs inside the main one, whose baseline stays
+    if (e.agentId !== undefined) return next(e)
     const r = await next(e)
-    await refreshInfo($)
+    // the latest reading: what the last turn ended on, since nothing spends between turns
     turnBase = { usd: costUsd, five: five?.pct, week: week?.pct }
+    void refresh($)
     $.ui.invalidate('ui.render')
     return r
   })
 
   on('turn.step', async function* ($, e, next) {
     if (e.agentId) return yield* next(e)
-    const startedAt = Date.now()
+    const startedAt = await $.clock.now().catch(() => Date.now())
     const r = yield* next(e)
     if (r.usage) {
-      samples.push({
+      const prev = samples[samples.length - 1]
+      const cur: Sample = {
         turnId: e.turnId,
         index: e.index,
         model: r.usage.model || e.model,
@@ -553,19 +617,14 @@ export const register: Register = (on, options) => {
         write: r.usage.cache_creation_input_tokens,
         fresh: r.usage.input_tokens,
         output: r.usage.output_tokens,
-      })
+      }
+      samples.push(cur)
       if (samples.length > KEEP) samples = samples.slice(-KEEP)
+      if (!turnNo.has(e.turnId)) turnNo.set(e.turnId, turnNo.size + 1)
       if (!pinned) {
-        // the account can change under a session: a subscription running out of plan usage moves to usage credits
-        account = accountOf((await $.session.usage().catch(() => undefined))?.rateLimits ?? [])
-        const choice = decideTtl(options.ttl, env, setting, account)
-        baseTtl = choice.ttl
-        envSource = choice.source
-        if (observed === undefined) {
-          ttl = baseTtl
-          ttlSource = envSource
-        }
-        const seen = observeTtl(samples[samples.length - 2], samples[samples.length - 1], observed)
+        // the account as last read; the refresh below re-reads it and retunes
+        retune()
+        const seen = observeTtl(prev, cur, observed)
         if (seen !== observed) {
           observed = seen
           ttl = seen ?? baseTtl
@@ -574,7 +633,7 @@ export const register: Register = (on, options) => {
         }
       }
       lastKey = ''
-      await refreshInfo($)
+      void refresh($)
       if (showStatus) $.ui.status(shortLine(policy, Date.now()))
       $.ui.invalidate('ui.render')
     }
@@ -623,9 +682,9 @@ export const register: Register = (on, options) => {
   })
 
   // Two rows above the prompt, each a left group and a right group pushed to the edges:
-  //   Opus 5.5  ~/Project/mod  git:(main*)                          Cache 99.5%  ━━━━━━━━━━ 60m
-  //   Context ━━━━━━━━━━ 19%   5h ━━━━━━━━━━ 9%   Week ━━━━━━━━━━ 4%          Bash×3  Edit×1
-  // Labels are plain words; each gauge is a thin track that warms from green to red along its length.
+  //   Opus 5.5  ~/Project/mod  git:(main*)              Turn $0.42 +0.8%  ● Cache 1h ████████████ 58m  hit 99.6%
+  //   Context ███▌████████ 22%   5h █▎██████████ 10%   Week ▌███████████ 4%          Tools Bash×3  Edit×1
+  // Labels are plain words; each gauge is a solid bar that warms from green to red along its length.
   // When the row is short, the richest variant that fits wins, so it never wraps.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const yieldTo = !showBand ? 'off' : below ? undefined : e.props.hasSurvey ? 'survey' : isPaneOpen ? 'pane' : undefined
@@ -696,7 +755,10 @@ export const register: Register = (on, options) => {
     const life = lifeRatio(left, ttl)
     const lifeFilled = Math.round(life * barW)
     const [sr, sw, sn] = last ? segments(last.read, last.write, last.fresh, barW) : [0, 0, 0]
-    const rows = all.slice(-Math.max(3, (e.viewport?.rows ?? 24) - 16))
+    // the latest turns that fit in the pane's own room, after the rows drawn around the table:
+    // title 1, clock 2 (+1 bar), advice 2 (+1 model), stack 3, table head 2, footer 6
+    const around = 13 + (counting ? 1 : 0) + (last ? 4 : 0)
+    const rows = all.slice(-Math.max(3, e.props.scroll.bodyRows - around))
     const icon = advice.kind === 'warm' ? '●' : advice.kind === 'soon' ? '▲' : advice.kind === 'expired' || advice.kind === 'miss' ? '✖' : '○'
 
     return (
@@ -746,7 +808,7 @@ export const register: Register = (on, options) => {
           </Box>
           {rows.length === 0 ? <Text dimColor>{sp('no requests yet')}</Text> : null}
           {rows.map((row, i) => {
-            const n = all.length - rows.length + i + 1
+            const n = turnNo.get(row.turnId) ?? all.length - rows.length + i + 1
             const pct = Math.round(rowRatio(row) * 100)
             return (
               <Box key={`t:${row.turnId}`} flexDirection="row" columnGap={1}>
