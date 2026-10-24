@@ -117,7 +117,9 @@ def code_mask(cmd):
         elif c == ')' and stack:
             stack.pop()
             i += 1
-        elif c == '<' and cmd.startswith('<<', i) and not cmd.startswith('<<<', i):
+        elif c == '<' and cmd.startswith('<<<', i):
+            i += 3  # here-string: its operand is a word, never a heredoc delimiter
+        elif c == '<' and cmd.startswith('<<', i):
             m = HEREDOC.match(cmd, i)
             if m:
                 heredocs.append((m.group(3), bool(m.group(1))))
