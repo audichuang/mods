@@ -12,7 +12,7 @@ import sys
 SEP = r'(?:^|[;&|(!\n"\']|\$\(|\b(?:do|then|while|until|if)\b)\s*'
 WRAP = (r'(?:\w+=\S*\s+'
         r'|timeout\s+(?:-\S+\s+(?:\d\S*\s+)?)*\S+\s+'
-        r'|nice\s+(?:-n\s*-?\d+\s+)?|env\s+(?:-\S+\s+)*'
+        r'|nice\s+(?:-n\s*-?\d+\s+)?|env\s+(?:-u\s+\S+\s+|-\S+\s+)*|stdbuf\s+(?:-\S+\s+)*'
         r'|xargs\s+(?:-\S+\s+(?:\d+\s+)?)*'
         r'|ssh\s+[^;&|\n]*?\s'
         r'|(?:nohup|sudo|time|command|exec)\s+)*')
@@ -21,13 +21,14 @@ WATCH = re.compile(POS + r'gh\s+run\s+watch\b')
 CHECKS = re.compile(POS + r'gh\s+pr\s+checks\b[^;&|\n]*--watch')
 # watch(1) re-runs its command forever, every 2 s by default.
 WATCH_CMD = re.compile(POS + r'watch\b[^;&|\n]*\bgh\s')
-LOOP = re.compile(r'(?:^|[;&|(\n]|\bdo\b|\bthen\b)\s*(while|until|for)\b')
+# A loop is judged by its own body (keyword .. done), so gh or sleep outside it doesn't count.
+LOOP = re.compile(r'(?:^|[;&|(\n]|\bdo\b|\bthen\b)\s*(while|until|for)\b(.*?)\bdone\b', re.S)
 GH_CALL = re.compile(POS + r'gh\s+(?:api|run|pr)\b')
 SLEEP = re.compile(r'\bsleep\s+(\d+(?:\.\d+)?)([smhd]?)\b')
 UNIT = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
 # Anonymous REST calls share the exit IP's 60/hr; `gh api` uses the account's 5000/hr.
 ANON_CURL = re.compile(POS + r'(?:curl|wget)\b[^;&|\n]*api\.github\.com')
-AUTH = re.compile(r'(?i)authorization:|\$\(gh auth token\)|GITHUB_TOKEN|GH_TOKEN')
+AUTH = re.compile(r'(?i)authorization:|\$\(gh auth token\)|\$\{?(?:GITHUB_TOKEN|GH_TOKEN)\b')
 
 HINT = ('等 CI 請改用 `gh-wait run <run-id> -R owner/repo` 或 `gh-wait pr <number> -R owner/repo`'
         '（ETag 條件請求，狀態沒變時 304 不扣額度；放背景跑，結束會通知）。'
@@ -44,13 +45,15 @@ def reason(cmd):
                 '改用 `gh api <path>`（走帳號的 5000 次）。')
     if WATCH_CMD.search(cmd):
         return '`watch … gh` 會每隔幾秒重跑 gh，會吃光共用的 5000/hr GitHub 額度。'
-    loops = {m.group(1) for m in LOOP.finditer(cmd)}
-    if loops and GH_CALL.search(cmd):
-        sleeps = [float(n) * UNIT[u] for n, u in SLEEP.findall(cmd)]
+    for m in LOOP.finditer(cmd):
+        kind, body = m.group(1), m.group(0)
+        if not GH_CALL.search(body):
+            continue
+        sleeps = [float(n) * UNIT[u] for n, u in SLEEP.findall(body)]
         if sleeps and min(sleeps) < 60:
             return f'用 sleep {min(sleeps):g} 秒的迴圈輪詢 gh，會吃光共用的 5000/hr GitHub 額度。'
         # `for` over a fixed list is a batch, not polling; while/until without sleep spins.
-        if not sleeps and loops & {'while', 'until'}:
+        if not sleeps and kind in ('while', 'until'):
             return '沒有 sleep 的 while／until 迴圈呼叫 gh，會連續狂打共用的 5000/hr GitHub 額度。'
     return None
 

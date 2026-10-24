@@ -34,6 +34,14 @@ DENY|curl -s https://api.github.com/repos/a/b/releases/latest
 DENY|wget -qO- https://api.github.com/rate_limit
 allow|curl -s -H "Authorization: Bearer $(gh auth token)" https://api.github.com/repos/a/b
 allow|curl -fsSL https://github.com/a/b/releases/download/v1/x.tar.gz -o x.tgz
+DENY|env -u FOO gh run watch 1
+DENY|stdbuf -oL gh run watch 1
+DENY|curl -H "X: GITHUB_TOKEN_FAKE" https://api.github.com/x
+DENY|gh api x; while true; do gh run view 1 --json status; sleep 10; done
+allow|curl -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/x
+allow|gh run view 1; while read l; do echo $l; done < f
+allow|while true; do gh api x; sleep 90; done; sleep 5
+allow|for i in 1 2; do gh api x; done; sleep 5
 allow|gh run view 123 --log-failed
 allow|for i in 1 2; do gh api x; sleep 2m; done
 allow|gh pr comment 1 --body "ready for review"; sleep 3; gh pr view 1

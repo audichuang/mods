@@ -1,1 +1,1 @@
-{"name": "audi-mods", "owner": {"name": "audichuang"}, "plugins": [{"name": "zh-steady", "source": "./zh-steady"}, {"name": "gh-quota", "source": "./gh-quota"}]}
+{"name": "audi-mods", "owner": {"name": "audichuang"}, "plugins": [{"name": "zh-steady", "source": "./zh-steady"}, {"name": "gh-quota", "source": "./gh-quota"}, {"name": "gh-quota-meter", "source": "./gh-quota-meter"}]}

@@ -1,1 +1,1 @@
-{ "name": "gh-quota", "version": "0.1.2", "description": "避免 agent 吃光共用的 GitHub API 額度：gh-wait（用 ETag 等 CI）、擋下 gh 輪詢與匿名 curl 的 hook、教 agent 怎麼等的 skill。" }
+{ "name": "gh-quota", "version": "0.1.3", "description": "避免 agent 吃光共用的 GitHub API 額度：gh-wait（用 ETag 等 CI）、擋下 gh 輪詢與匿名 curl 的 hook、教 agent 怎麼等的 skill。" }
