@@ -14,9 +14,11 @@
 
 ## 驗證
 
-- mod（含 `hooks/*.ts(x)`）：`claude plugin test <dir>`、`claude plugin validate <dir>`，型別檢查照 plugin-authoring skill 型別檔開頭的 tsconfig（`strict`、`noUncheckedIndexedAccess`）；prompt-glance 在這個旗標下本來就有一批舊錯，比對改動前的錯誤數，別當成自己弄壞的。測試環境沒有 `setTimeout`；`clock.every` 的替身每回一次 `{ value }` 就是過了一個週期，只想測啟動時那次就回 `{ deny }`。
-- `gh-quota` hook：`bash gh-quota/tests/hooktest.sh`，全部 `ok`。改 `gh-quota-guard.py` 前先加案例。
-- 整個 marketplace：`claude plugin validate ~/mods`。
+- push 前跑 `bash scripts/check.sh`（要比對 version 有沒有調就加 `BASE=origin/main`），全綠才推；CI（`.github/workflows/ci.yml`）在 push／PR 跑同一支，每週一另用最新版 Claude Code 跑一次。它包含：marketplace 與每個 plugin 的 `claude plugin validate --strict`、每個 mod 的 `claude plugin test`、官方 strict tsconfig 的 `tsc`、`hooktest.sh`、shellcheck、manifest 一致性、產生檔沒進 git、改了 plugin 有調 version。
+- 型別檢查用 repo 裡的 `ci/types/claude-code.d.ts`（`.claude-plugin/types/` 只有 engine 載入時才寫、而且 gitignore，CI 拿不到）。升 Claude Code 後跑 `scripts/sync-types.sh` 同步型別檔和 `ci/claude-version`。prompt-glance 的舊錯數記在 `ci/tsc-baseline`：只准變少，修掉就把數字改小。
+- 新增 mod：資料夾裡有 `.claude-plugin/plugin.json` 就會被 check.sh 撿到，`hooks/hooks.json` 有 `modules` 就當 mod 跑 test 和 tsc；`plugin.json` 要有 `author`，不然 `--strict` 不過。
+- 測試環境沒有 `setTimeout`；`clock.every` 的替身每回一次 `{ value }` 就是過了一個週期，只想測啟動時那次就回 `{ deny }`。
+- `gh-quota` hook：改 `gh-quota-guard.py` 前先在 `hooktest.sh` 加案例。
 - 實際互動 session 驗 mod：這台沒有 tmux，用 `(sleep 60 | script -q /dev/null claude >out 2>&1 &)`，在**已信任**的資料夾開（`~/mods` 尚未信任會卡在信任提示），看 log 或去掉 ANSI 後 grep 輸出。這只證明文字有畫出來，看不出位置；改版面要請使用者截圖確認。
 
 ## 發版與部署

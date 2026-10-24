@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 每週一用最新版 Claude Code 再跑一次，提早發現 early-access API 改動
+    - cron: "17 1 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        channel: ${{ github.event_name == 'schedule' && fromJSON('["latest"]') || fromJSON('["pinned"]') }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code
+        env:
+          CHANNEL: ${{ matrix.channel }}
+          DISABLE_AUTOUPDATER: "1"
+        run: |
+          v=latest
+          [ "$CHANNEL" = pinned ] && v=$(cat ci/claude-version)
+          npm install -g "@anthropic-ai/claude-code@$v"
+          claude --version
+
+      - name: Quality gate
+        env:
+          DISABLE_AUTOUPDATER: "1"
+          # push 比對推上來之前的 commit，PR 比對 base branch：改了 plugin 卻沒調 version 就擋
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/check.sh

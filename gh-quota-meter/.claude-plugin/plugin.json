@@ -2,6 +2,10 @@
   "name": "gh-quota-meter",
   "version": "0.1.5",
   "description": "查 GitHub API 剩餘額度（REST／GraphQL）寫進 meter.log，低於 1000 時提醒一次；狀態列顯示為選用（prompt-glance 的 HUD 已顯示額度）。",
+  "author": {
+    "name": "audichuang",
+    "url": "https://github.com/audichuang"
+  },
   "userConfig": {
     "status": {
       "type": "boolean",
