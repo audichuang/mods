@@ -22,7 +22,7 @@ gh-wait pr <number> -R owner/repo      # 等 PR head commit 的所有 checks
 - gh 沒登入會立刻結束（結束碼 2）；網路錯誤或 5xx 會重試，連續 5 次才放棄；額度用完（403／429 且剩 0）會等到重置時間再繼續，不算錯誤。
 - 它帶 ETag 做條件請求，狀態沒變時 GitHub 回 304，不扣額度；只有狀態真的變了才算一次。
 - 狀態 5 分鐘沒變會印 `unchanged for N min: …`（`pr` 模式會列出還在跑的 check）；一直卡住就是 CI 本身卡死，不是還在正常等。
-- `pr` 模式看 head commit 的 check runs（Actions 與其他 GitHub App），不看外部服務的舊式 commit status，最多讀 100 個 check；等待中 PR 又 push，它仍盯著開始時的那個 commit。
+- `pr` 模式看 head commit 的 check runs（Actions 與其他 GitHub App），不看外部服務的舊式 commit status，最多讀 100 個 check；等待中 PR 又 push，它仍盯著開始時的那個 commit。每次 check runs 全綠時都會再查一次 check suites（這段空檔每輪多花 1 次請求），有 check run 的 suite 都跑完才算成功，所以 `needs:` 的後續 job 還沒建出 check run 時會印 `wait:N workflow still running` 繼續等，不會提早回 0。
 
 ## 等 checks 過了就合併
 
