@@ -10,6 +10,8 @@ PINNED=$(cat ci/claude-version)
 TS=typescript@5.9.3
 fails=()
 step() { printf '\n== %s\n' "$*"; }
+version() { python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null; }
+newer() { python3 -c 'import sys;v=lambda s:tuple(int(x) for x in s.split("."));sys.exit(0 if v(sys.argv[1])>v(sys.argv[2]) else 1)' "$1" "$2" 2>/dev/null; }
 fail() { echo "FAIL: $*"; fails+=("$*"); }
 
 # 有 .claude-plugin/plugin.json 的資料夾都是 plugin；有 hooks module 的叫 mod
@@ -76,9 +78,12 @@ for p in "${mods[@]}"; do
 "strict":true,"noUncheckedIndexedAccess":true,"noEmit":true,"skipLibCheck":true,
 "jsx":"react","jsxFactory":"h","jsxFragmentFactory":"Fragment"},"include":[$inc]}
 EOF
-  n=$(npx -y -p "$TS" tsc -p "$tmp/$p.json" 2>&1 | tee "$tmp/$p.out" | grep -c 'error TS')
+  npx -y -p "$TS" tsc -p "$tmp/$p.json" >"$tmp/$p.out" 2>&1; rc=$?
+  n=$(grep -c 'error TS' "$tmp/$p.out")
   base=$(awk -v p="$p" '$1==p{print $2}' ci/tsc-baseline 2>/dev/null); base=${base:-0}
-  if [ "$n" -gt "$base" ]; then cat "$tmp/$p.out"; fail "tsc ${p}：$n 個錯（基準 ${base}）"
+  # tsc 失敗卻沒有任何 error TS（npx 抓不到、tsconfig 壞掉）＝根本沒檢查到，不能當 0 個錯
+  if [ "$rc" -ne 0 ] && [ "$n" -eq 0 ]; then cat "$tmp/$p.out"; fail "tsc ${p} 沒跑起來（exit ${rc}）"
+  elif [ "$n" -gt "$base" ]; then cat "$tmp/$p.out"; fail "tsc ${p}：$n 個錯（基準 ${base}）"
   elif [ "$n" -lt "$base" ]; then echo "ok   ${p}：$n 個錯，比基準 $base 少，把 ci/tsc-baseline 改成 $n"
   else echo "ok   ${p}：$n 個錯${base:+（基準 ${base}）}"; fi
 done
@@ -87,7 +92,7 @@ step "gh-quota（Python command hook 與 bash）"
 python3 -B -c 'import ast,sys;[ast.parse(open(f).read(),f) for f in sys.argv[1:]]' gh-quota/hooks/*.py || fail "gh-quota Python 語法"
 for t in gh-quota/tests/*.sh; do
   n=$(basename "$t" .sh)
-  if out=$(bash "$t" 2>&1) && ! grep -qv '^ok ' <<<"$out"; then
+  if out=$(bash "$t" 2>&1) && ! grep -qv '^ok ' <<<"$out" && grep -q '^ok ' <<<"$out"; then
     echo "ok   ${n}：$(grep -c '^ok ' <<<"$out") 個案例"
   else echo "$out" | grep -v '^ok '; fail "gh-quota $n"; fi
 done
@@ -104,9 +109,9 @@ if [ -n "${BASE:-}" ] && git cat-file -e "$BASE" 2>/dev/null; then
   for p in "${plugins[@]}"; do
     changed=$(git diff --name-only "$BASE" HEAD -- "$p" | grep -vE "^$p/(tests/|README\.md$|LICENSE$|\.claude-plugin/plugin\.json$|.*\.test\.tsx?$|.*__pycache__/.*|.*\.pyc$)")
     [ -z "$changed" ] && continue
-    old=$(git show "$BASE:$p/.claude-plugin/plugin.json" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
-    new=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' "$p/.claude-plugin/plugin.json")
-    if [ -n "$old" ] && [ "$old" = "$new" ]; then fail "$p 改了行為檔卻沒調 version（仍是 ${new}）：$(echo $changed)"; else echo "ok   $p ${old:-新} → $new"; fi
+    old=$(git show "$BASE:$p/.claude-plugin/plugin.json" 2>/dev/null | version)
+    new=$(version < "$p/.claude-plugin/plugin.json")
+    if [ -n "$old" ] && ! newer "$new" "$old"; then fail "$p 改了行為檔，version 要比 $old 大（現在是 ${new}）：$(echo $changed)"; else echo "ok   $p ${old:-新} → $new"; fi
   done
 fi
 
