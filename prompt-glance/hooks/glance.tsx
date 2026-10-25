@@ -46,8 +46,9 @@ import {
   isCachingDisabled,
   accountOf,
   cells,
-  countMisses,
-  sessionHit,
+  addToTotals,
+  emptyTotals,
+  totalsHit,
   decideTtl,
   observeTtl,
   lifeColor,
@@ -59,7 +60,7 @@ import {
   rowRatio,
   segments,
 } from './cache'
-import type { Account, Advice, BandPart, BandSeg, CacheEnv, Sample, Ttl } from './cache'
+import type { Account, Advice, BandPart, BandSeg, CacheEnv, Sample, SessionTotals, Ttl } from './cache'
 import { deltaColor, fmtPct, fmtShort, fmtUsd, heat, turnSpend, heatGauge, lineGauge, modelColor, parseGitStatus, parseRateLimit, prettyModel, SCALE, shortAdvice, shortPath, topTools } from './hud'
 import type { GhQuota, ToolTally } from './hud'
 
@@ -70,6 +71,8 @@ const KEEP = 200
 const TOAST_MIN_TOKENS = 20_000
 
 let samples: Sample[] = []
+// the whole conversation's reads, writes, uncached input and misses, beyond the KEEP samples
+let totals: SessionTotals = emptyTotals()
 let ttl: Ttl = '5m'
 let baseTtl: Ttl = '5m'
 let pinned = false
@@ -199,6 +202,7 @@ function refresh($: EngineInterface, withBranch = false): Promise<void> {
 /** A conversation of its own: its cache, its requests, its turns and its activity start over. */
 function newConversation() {
   samples = []
+  totals = emptyTotals()
   lastKey = ''
   toastedFor = 0
   toastLevel = Infinity
@@ -333,8 +337,8 @@ function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: P
   // row one, right: the cache, its hit rate and how long it stays warm
   const state = shortAdvice(advice, last ? fmtTokens(promptTokens(last)) : undefined)
   // the session's hit rate and misses: the last request alone sits near 100% in any long conversation
-  const sessionHitRatio = sessionHit(samples)
-  const misses = countMisses(samples, ttl)
+  const sessionHitRatio = totalsHit(totals)
+  const misses = totals.misses
   const ratio = sessionHitRatio
   const counting = !!last && advice.kind !== 'uncached' && advice.kind !== 'off'
   const lifeC = counting ? (left > 0 ? lifeColor(left, ttl, policy.warnMs) : 'red') : undefined
@@ -636,6 +640,7 @@ export const register: Register = (on, options) => {
         fresh: r.usage.input_tokens,
         output: r.usage.output_tokens,
       }
+      totals = addToTotals(totals, prev, cur, ttl)
       samples.push(cur)
       if (samples.length > KEEP) samples = samples.slice(-KEEP)
       if (!turnNo.has(e.turnId)) turnNo.set(e.turnId, turnNo.size + 1)

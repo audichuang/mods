@@ -376,3 +376,27 @@ export function countMisses(samples: readonly Sample[], ttl: Ttl): number {
   }
   return n
 }
+
+/**
+ * A conversation's running figures, every main-loop request counted: the
+ * samples keep only the latest few hundred, these keep the whole conversation.
+ */
+export type SessionTotals = { read: number; write: number; fresh: number; misses: number }
+
+export const emptyTotals = (): SessionTotals => ({ read: 0, write: 0, fresh: 0, misses: 0 })
+
+/** `totals` with `cur` added; `prev` is the request before it, to tell a miss. */
+export function addToTotals(totals: SessionTotals, prev: Sample | undefined, cur: Sample, ttl: Ttl): SessionTotals {
+  return {
+    read: totals.read + cur.read,
+    write: totals.write + cur.write,
+    fresh: totals.fresh + cur.fresh,
+    misses: totals.misses + (missReason(prev, cur, ttl) ? 1 : 0),
+  }
+}
+
+/** The share of all the conversation's prompt tokens the cache served, 0 to 1; 0 before any. */
+export function totalsHit(t: SessionTotals): number {
+  const total = t.read + t.write + t.fresh
+  return total === 0 ? 0 : t.read / total
+}
