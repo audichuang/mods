@@ -72,7 +72,7 @@ The mod follows Claude Code's own rules ([prompt caching: cache lifetime](https:
 | 1 | the mod's `ttl` option (`5m` / `1h`) | what you set |
 | 2 | `FORCE_PROMPT_CACHING_5M=1` | 5 minutes |
 | 3 | `CLAUDE_CODE_PROMPT_CACHE_TTL` | `5m` or `1h` |
-| 4 | the `promptCacheTtl` setting (local, project or user settings file) | `5m` or `1h` |
+| 4 | the `promptCacheTtl` setting (as Claude Code merges it: managed, `--settings`, local, project, user) | `5m` or `1h` |
 | 5 | `ENABLE_PROMPT_CACHING_1H=1` | 1 hour |
 | 6 | the account | **1 hour on a Claude subscription within its plan usage**; 5 minutes on usage credits, an API key or a cloud provider |
 

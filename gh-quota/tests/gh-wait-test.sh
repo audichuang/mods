@@ -40,7 +40,7 @@ gw() {
     kill "$killer" 2> /dev/null; wait "$killer" 2> /dev/null
     out=$(cat "$T/out"); err=$(cat "$T/err")
 }
-# check <name> <want-rc> [stdout-has|stderr-has|stderr-lacks|argv-has|calls]=<text> ...
+# check <name> <want-rc> [stdout-has|stdout-lacks|stderr-has|stderr-lacks|argv-has|argv-lacks|calls]=<text> ...
 check() {
     local name=$1 want=$2 c why=''; shift 2
     [ "$rc" = "$want" ] || why="rc $rc, want $want"
@@ -48,8 +48,10 @@ check() {
         case $c in
             stdout-has=*) grep -qF -- "${c#*=}" <<< "$out" || why="$why; stdout lacks '${c#*=}'" ;;
             stderr-has=*) grep -qF -- "${c#*=}" <<< "$err" || why="$why; stderr lacks '${c#*=}'" ;;
+            stdout-lacks=*) grep -qF -- "${c#*=}" <<< "$out" && why="$why; stdout has '${c#*=}'" ;;
             stderr-lacks=*) grep -qF -- "${c#*=}" <<< "$err" && why="$why; stderr has '${c#*=}'" ;;
             argv-has=*) grep -qF -- "${c#*=}" "$S/argv" || why="$why; no gh call had '${c#*=}'" ;;
+            argv-lacks=*) grep -qF -- "${c#*=}" "$S/argv" && why="$why; a gh call had '${c#*=}'" ;;
             calls=*) [ "$(wc -l < "$S/argv" | tr -d ' ')" = "${c#*=}" ] || why="$why; $(wc -l < "$S/argv" | tr -d ' ') gh calls, want ${c#*=}" ;;
         esac
     done
@@ -59,6 +61,9 @@ check() {
 
 RUN_WAIT='{"status":"in_progress","conclusion":null}'
 RUN_OK='{"status":"completed","conclusion":"success"}'
+RUNS_OK='{"check_runs":[{"name":"lint","status":"completed","conclusion":"success"}]}'
+SUITES_RUNNING='{"check_suites":[{"app":{"name":"GitHub Actions"},"status":"in_progress","latest_check_runs_count":1}]}'
+SUITES_DONE='{"check_suites":[{"app":{"name":"GitHub Actions"},"status":"completed","conclusion":"success","latest_check_runs_count":2}]}'
 
 fresh
 resp 1 '200 OK' "$RUN_WAIT" 'Etag: W/"abc"'
@@ -80,15 +85,86 @@ echo abc123 > "$S/1.out"
 resp 2 '200 OK' '{"total_count":0,"check_runs":[]}' 'ETag: "e1"'
 resp 3 '200 OK' '{"check_runs":[{"name":"ci","status":"in_progress","conclusion":null},{"name":"lint","status":"completed","conclusion":"success"}]}' 'ETag: "e2"'
 resp 4 '200 OK' '{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"},{"name":"lint","status":"completed","conclusion":"skipped"}]}'
+resp 5 '200 OK' "$SUITES_DONE"
 gw 20 pr 5 -R o/r -i 1
 check "pr: no checks, running, ok" 0 'stdout-has=wait:no checks yet' 'stdout-has=wait:1 running (ci)' stdout-has=ok \
-    argv-has=repos/o/r/pulls/5 argv-has=repos/o/r/commits/abc123/check-runs 'argv-has=If-None-Match: "e1"'
+    argv-has=repos/o/r/pulls/5 argv-has=repos/o/r/commits/abc123/check-runs 'argv-has=If-None-Match: "e1"' \
+    argv-has=repos/o/r/commits/abc123/check-suites calls=5
+
+# A job with needs: has no check run until the jobs it needs finish, so every existing run can be
+# green while its workflow (check suite) is still in progress.
+fresh
+echo abc123 > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK" 'ETag: "e1"'
+resp 3 '200 OK' "$SUITES_RUNNING"
+resp 4 '200 OK' '{"check_runs":[{"name":"lint","status":"completed","conclusion":"success"},{"name":"test","status":"in_progress","conclusion":null}]}' 'ETag: "e2"'
+resp 5 '200 OK' '{"check_runs":[{"name":"lint","status":"completed","conclusion":"success"},{"name":"test","status":"completed","conclusion":"success"}]}' 'ETag: "e3"'
+resp 6 '200 OK' "$SUITES_DONE"
+gw 20 pr 5 -R o/r -i 1
+check "pr: green runs but suite in progress waits for the suite" 0 'stdout-has=wait:1 workflow still running' \
+    'stdout-has=wait:1 running (test)' stdout-has=ok argv-has=repos/o/r/commits/abc123/check-suites calls=6
+
+# After the downgrade the stored ETag must go, or the next poll gets 304 and never re-checks the suites.
+fresh
+echo abc123 > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK" 'ETag: "e1"'
+resp 3 '200 OK' "$SUITES_RUNNING"
+resp 4 '200 OK' "$RUNS_OK" 'ETag: "e1"'
+resp 5 '200 OK' "$SUITES_DONE"
+gw 20 pr 5 -R o/r -i 1
+check "pr: downgrade to wait clears the ETag" 0 'stdout-has=wait:1 workflow still running' stdout-has=ok \
+    argv-lacks=If-None-Match calls=5
+
+fresh
+echo abc123 > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' '{"check_suites":[{"app":{"name":"Some App"},"status":"queued","latest_check_runs_count":0},{"app":{"name":"GitHub Actions"},"status":"completed","conclusion":"success","latest_check_runs_count":1}]}'
+gw 20 pr 5 -R o/r -i 1
+check "pr: queued suite with no runs is ignored" 0 stdout-has=ok stdout-lacks=wait calls=3
+
+fresh
+echo abc123 > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '502 Bad Gateway' '{"message":"Server Error"}'
+echo 'gh: Server Error (HTTP 502)' > "$S/3.err"; echo 1 > "$S/3.rc"
+resp 4 '200 OK' "$RUNS_OK"
+resp 5 '200 OK' "$SUITES_DONE"
+gw 20 pr 5 -R o/r -i 1
+check "pr: check-suites error is not ok, retried" 0 'stderr-has=HTTP 502' stdout-has=ok calls=5
+
+fresh
+echo abc123 > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK"
+printf 'To get started with GitHub CLI, please run:  gh auth login\n' > "$S/3.err"; echo 4 > "$S/3.rc"
+gw 20 pr 5 -R o/r -i 1
+check "pr: check-suites not logged in stops" 2 'stderr-has=gh auth login' calls=3
+
+# A downstream job can appear and fail between the check-runs read and the suites read: the suite
+# is completed but failed, and the green runs snapshot is stale. Re-read the runs, never report ok.
+fresh
+echo abc123 > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' '{"check_suites":[{"app":{"name":"GitHub Actions"},"status":"completed","conclusion":"failure","latest_check_runs_count":2}]}'
+resp 4 '200 OK' '{"check_runs":[{"name":"lint","status":"completed","conclusion":"success"},{"name":"e2e","status":"completed","conclusion":"failure"}]}'
+gw 20 pr 5 -R o/r -i 1
+check "pr: a suite that failed after a green runs read is not ok" 1 'stdout-has=fail:e2e' calls=4
+
+# check-suites failing over and over must hit the same 5-error limit as the main request.
+fresh
+echo abc123 > "$S/1.out"
+for n in 2 4 6 8 10; do
+    resp $n '200 OK' "$RUNS_OK"
+    resp $((n + 1)) '503 Service Unavailable' '{"message":"Unavailable"}'
+    echo 'gh: Unavailable (HTTP 503)' > "$S/$((n + 1)).err"; echo 1 > "$S/$((n + 1)).rc"
+done
+gw 30 pr 5 -R o/r -i 1
+check "pr: check-suites failing 5 times in a row gives up" 2 'stderr-has=HTTP 503' calls=11
 
 fresh
 echo abc123 > "$S/1.out"
 resp 2 '200 OK' '{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"},{"name":"lint","status":"completed","conclusion":"failure"}]}'
 gw 20 pr 5 -R o/r -i 1
-check "pr: failure names the check" 1 stdout-has=fail:lint
+check "pr: failure names the check" 1 stdout-has=fail:lint calls=2
 
 fresh
 resp 1 '200 OK' "$RUN_WAIT" 'Etag: W/"abc"'

@@ -76,7 +76,7 @@ let envSource = 'default'
 let pinned = false
 // the ttl option, as the config menu set it
 let ttlOption: unknown
-let setting: unknown
+let setting: Ttl | undefined
 let account: Account = 'other'
 let env: CacheEnv = {}
 let timer: { cancel: () => void } | undefined
@@ -309,21 +309,10 @@ function shortLine(policy: Policy, now: number): string {
   return `cache ${Math.round(hitRatio(last) * 100)}%${clock}`
 }
 
-// the promptCacheTtl setting, from the settings files that can carry it (local over project over user)
-async function readSetting($: EngineInterface): Promise<unknown> {
-  const home = await $.env.get('HOME').catch(() => undefined)
-  const cwd = await $.session.cwd().catch(() => undefined)
-  const files = [cwd && `${cwd}/.claude/settings.local.json`, cwd && `${cwd}/.claude/settings.json`, home && `${home}/.claude/settings.json`]
-  for (const file of files) {
-    if (!file) continue
-    try {
-      const value = JSON.parse(await $.fs.read(file)).promptCacheTtl
-      if (value === '5m' || value === '1h') return value
-    } catch {
-      // missing or unreadable: the next file
-    }
-  }
-  return undefined
+// the promptCacheTtl setting as the engine merges it (policy, --settings, CLAUDE_CONFIG_DIR's user file, project, local)
+async function readSetting($: EngineInterface): Promise<Ttl | undefined> {
+  const value = await $.settings.read({ key: 'promptCacheTtl' }).catch(() => undefined)
+  return value === '5m' || value === '1h' ? value : undefined
 }
 
 // The HUD's rows for a site `columns` wide, built from that site's element table.

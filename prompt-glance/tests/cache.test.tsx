@@ -1107,23 +1107,51 @@ describe('the activity and the windows', () => {
 })
 
 describe('the promptCacheTtl setting', () => {
-  test('the project\'s local settings win over the project\'s and the user\'s', async ($, on) => {
+  // the engine's merged settings (policy, --settings, CLAUDE_CONFIG_DIR's user file and the rest), not files the mod picks
+  const settingsSay = (on: On, answer: () => unknown) => on('settings.read', () => answer() as never)
+
+  test('the merged settings decide, over the subscription default', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
-    fakeEngine(on, { HOME: '/home/u' }, calls, undefined, [{ kind: 'five_hour', percentUsed: 12 }])
-    const files: Record<string, string> = {
-      '/repo/.claude/settings.local.json': '{"promptCacheTtl":"5m"}',
-      '/repo/.claude/settings.json': '{"promptCacheTtl":"1h"}',
-      '/home/u/.claude/settings.json': '{"promptCacheTtl":"1h"}',
-    }
-    on('session.cwd', () => ({ value: '/repo' }) as never)
-    on('fs.read', ($, e) => {
-      const text = files[(e as { path: string }).path]
-      if (text === undefined) throw new Error('ENOENT')
-      return { value: text } as never
-    })
-    on('fs.write', () => ({ value: undefined }) as never)
+    fakeEngine(on, {}, calls, undefined, [{ kind: 'five_hour', percentUsed: 12 }])
+    settingsSay(on, () => ({ value: { promptCacheTtl: '5m' } }))
     await $.session.start(START)
     await loaded(calls)
     expect(calls.logs.join('\n')).toContain('5m cache (the promptCacheTtl setting)')
+  })
+
+  test('1h from the settings beats the usage-credits default', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls, undefined, [{ kind: 'five_hour', percentUsed: 100 }])
+    settingsSay(on, () => ({ value: { promptCacheTtl: '1h' } }))
+    await $.session.start(START)
+    await loaded(calls)
+    expect(calls.logs.join('\n')).toContain('1h cache (the promptCacheTtl setting)')
+  })
+
+  test('the environment variable still beats the setting', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, { CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' }, calls)
+    settingsSay(on, () => ({ value: { promptCacheTtl: '5m' } }))
+    await $.session.start(START)
+    await loaded(calls)
+    expect(calls.logs.join('\n')).toContain('1h cache (CLAUDE_CODE_PROMPT_CACHE_TTL)')
+  })
+
+  test('a value other than 5m or 1h is no setting', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls, undefined, [{ kind: 'five_hour', percentUsed: 12 }])
+    settingsSay(on, () => ({ value: { promptCacheTtl: '10m' } }))
+    await $.session.start(START)
+    await loaded(calls)
+    expect(calls.logs.join('\n')).toContain('1h cache (Claude subscription default)')
+  })
+
+  test('a settings read that fails leaves the default', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls, undefined, [{ kind: 'five_hour', percentUsed: 12 }])
+    settingsSay(on, () => ({ deny: 'settings unreadable' }))
+    await $.session.start(START)
+    await loaded(calls)
+    expect(calls.logs.join('\n')).toContain('1h cache (Claude subscription default)')
   })
 })

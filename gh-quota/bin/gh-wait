@@ -6,6 +6,9 @@
 #   gh-wait run <run-id> [-R owner/repo] [-i seconds] [-t timeout-minutes]
 #   gh-wait pr  <number> [-R owner/repo] [-i seconds] [-t timeout-minutes]
 #
+# pr waits for the head commit's check runs, then for every check suite that has runs
+# (a job with needs: gets its check run only after the jobs it needs finish).
+#
 # Exit: 0 success, 1 finished but failed, 2 usage/API error or timeout (default 120 min).
 # Needs gh and jq.
 set -uo pipefail
@@ -50,9 +53,49 @@ hdr() {
     awk -v k="$1" 'NR > 1 && /^\r?$/ {exit}
         {i = index($0, ":"); if (i && tolower(substr($0, 1, i - 1)) == tolower(k)) {v = substr($0, i + 1); gsub(/^ +|\r/, "", v); print v; exit}}' <<<"$resp"
 }
+# suites_done: every check suite of $sha that has check runs is completed and none failed.
+# Otherwise sets $suites to a wait: state and returns 1. A suite that failed after the check-runs
+# read means that snapshot is stale: wait, and the next poll re-reads the runs and reports the
+# failure by name. A failed request counts as not done (retried next poll, at most 5 in a row),
+# except gh not logged in or 401/404/422, which stop like the main request does.
+suites_done() {
+    local out rc code body
+    out=$(gh api -i "repos/$repo/commits/$sha/check-suites?per_page=100" 2>"$errf")
+    rc=$?
+    code=$(head -1 <<<"$out" | awk '{print $2}' | tr -d '\r')
+    if [ "$code" = 200 ]; then
+        body=$(awk 'f; /^\r?$/ {f=1}' <<<"$out")
+        suite_errors=0
+        suites=$(jq -r '[.check_suites[]? | select(.latest_check_runs_count > 0)] as $s
+            | [$s[] | select(.status != "completed")] as $running
+            | if ($running | length) > 0 then "wait:\($running | length) workflow still running (\([$running[] | .app.name // "?"] | unique | join(", ")))"
+              elif any($s[]; .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") then "wait:a workflow finished after the check-runs read, re-reading"
+              else "ok" end' <<<"$body") || exit 2
+        [ "$suites" = ok ]
+        return
+    fi
+    local err
+    err=$(head -3 "$errf" | tr '\r\n' '  ' | sed 's/ *$//')
+    if [ -z "$code" ] && { [ $rc -eq 4 ] || grep -qiE 'gh auth login|not logged in' "$errf"; }; then
+        echo "$(date +%H:%M:%S) gh is not logged in: ${err:-gh exited 4}" >&2
+        exit 2
+    fi
+    case $code in
+        401|404|422)
+            echo "$(date +%H:%M:%S) HTTP $code for check-suites${err:+: $err}" >&2
+            exit 2
+            ;;
+    esac
+    local what=${code:+HTTP $code}
+    suite_errors=$((suite_errors + 1))
+    echo "$(date +%H:%M:%S) check-suites: ${what:-gh api failed} (attempt $suite_errors): ${err:-gh exited $rc}" >&2
+    [ $suite_errors -ge 5 ] && exit 2
+    suites='wait:checking workflows'
+    return 1
+}
 errf=$(mktemp) || exit 2
 trap 'rm -f "$errf"' EXIT
-etag='' last='' errors=0 changed=$SECONDS beat=$SECONDS
+etag='' last='' errors=0 suite_errors=0 changed=$SECONDS beat=$SECONDS
 # GH_WAIT_MINUTE (seconds per -t minute) only exists so tests can time out quickly.
 deadline=$((SECONDS + timeout * ${GH_WAIT_MINUTE:-60}))
 while :; do
@@ -85,6 +128,13 @@ while :; do
             errors=0
             etag=$(hdr ETag)
             state=$(awk 'f; /^\r?$/ {f=1}' <<<"$resp" | jq -r "$jq_state") || exit 2
+            # pr: a job with needs: has no check run until the jobs it needs finish, so all-green
+            # runs can still have a workflow running. Ask the check suites once, only now.
+            if [ "$state" = ok ] && [ "$kind" = pr ] && ! suites_done; then
+                state=$suites
+                # Forget the ETag: unchanged check runs would answer 304 and never get here again.
+                etag=''
+            fi
             if [ "$state" != "$last" ]; then
                 echo "$(date +%H:%M:%S) $state"
                 changed=$SECONDS beat=$SECONDS
