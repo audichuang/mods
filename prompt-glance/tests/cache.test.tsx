@@ -812,6 +812,35 @@ describe('a new conversation in the same process', () => {
   })
 })
 
+describe('session figures beyond the last 200 requests', () => {
+  test('the hit rate and the misses count every request of the conversation, not just the samples kept', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const cache = { read: 0, write: 100_000 }
+    fakeEngine(on, {}, calls, cache)
+    await $.session.start(START)
+    // the first request writes the prefix; three more write it again: three misses
+    for (let i = 1; i <= 4; i++) await step($, { turnId: `t${i}` })
+    // then 210 hits push those four out of the 200 kept
+    cache.read = 100_000
+    cache.write = 0
+    for (let i = 5; i <= 214; i++) await step($, { turnId: `t${i}` })
+    const ui = await wide($)
+    // 21M read of 214 × 100,300 prompt tokens: 97.8%, where the last 200 alone say 99.7%
+    expect(await ui.find({ type: 'Text', text: /^97%$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^99\.7%$/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^  misses $/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^3$/ })).toBeDefined()
+    await ui.unmount()
+    // /clear starts the totals over
+    await $.session.end(END('clear'))
+    await step($, { turnId: 'n1' })
+    const after = await wide($)
+    expect(await after.find({ type: 'Text', text: /^99\.7%$/ })).toBeDefined()
+    expect(await after.find({ type: 'Text', text: /^  misses $/ })).toBeUndefined()
+    await after.unmount()
+  })
+})
+
 describe('nothing waits on git', () => {
   test('a slow git status holds no hook; the band draws what it has, the branch when git answers', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }

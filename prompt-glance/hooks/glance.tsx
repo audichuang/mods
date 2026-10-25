@@ -46,8 +46,9 @@ import {
   isCachingDisabled,
   accountOf,
   cells,
-  countMisses,
-  sessionHit,
+  addToTotals,
+  emptyTotals,
+  totalsHit,
   decideTtl,
   observeTtl,
   lifeColor,
@@ -59,7 +60,7 @@ import {
   rowRatio,
   segments,
 } from './cache'
-import type { Account, Advice, BandPart, BandSeg, CacheEnv, Sample, Ttl } from './cache'
+import type { Account, Advice, BandPart, BandSeg, CacheEnv, Sample, SessionTotals, Ttl } from './cache'
 import { deltaColor, fmtPct, fmtShort, fmtUsd, heat, turnSpend, heatGauge, lineGauge, modelColor, parseGitStatus, parseRateLimit, prettyModel, SCALE, shortAdvice, shortPath, topTools } from './hud'
 import type { GhQuota, ToolTally } from './hud'
 
@@ -69,22 +70,16 @@ const KEEP = 200
 // below this a lapsed cache costs too little to interrupt anyone about
 const TOAST_MIN_TOKENS = 20_000
 
-let samples: Sample[] = []
-let ttl: Ttl = '5m'
+// the lifetime Claude Code asks for, and why, before any request timing says otherwise
 let baseTtl: Ttl = '5m'
+let envSource = 'default'
 let pinned = false
 // the ttl option, as the config menu set it
 let ttlOption: unknown
-let observed: Ttl | undefined
 let setting: unknown
 let account: Account = 'other'
-let ttlSource = 'default'
-let envSource = 'default'
 let env: CacheEnv = {}
 let timer: { cancel: () => void } | undefined
-let lastKey = ''
-let toastedFor = 0
-let toastLevel = Infinity
 let isPaneOpen = false
 
 // the HUD's session figures, read off the engine every few seconds and drawn from here
@@ -94,25 +89,16 @@ let cwd = ''
 let home: string | undefined
 let git: { branch: string; dirty: boolean; ahead: number; behind: number } | undefined
 let ctxPct: number | undefined
-// what the session has cost so far, and the figures at the start of the current turn, so the turn's share shows
-let costUsd: number | undefined
-let turnBase: { usd?: number; five?: number; week?: number } | undefined
-// each usage read is numbered; one answered after a newer one has landed is dropped, so a slow read cannot undo it
-let usageAsked = 0
-let usageApplied = 0
+// each usage read is numbered (asked); one answered after a newer one has landed (applied) is dropped,
+// so a slow read cannot undo it
+const usageReads = { asked: 0, applied: 0 }
 let five: Window | undefined
 let week: Window | undefined
-let tally: ToolTally = new Map()
-// skills the main loop loaded, by name, and how often
-let skills = new Map<string, number>()
-// each turn's number in the conversation, counted apart from the samples, which keep only the last KEEP
-let turnNo = new Map<string, number>()
-let branchReadAt = 0
-let gitBusy = false
-// the account's GitHub REST quota; rate_limit itself costs none of it
-let ghQuota: GhQuota | undefined
-// the last check failed: the reading on show is an old one
-let ghStale = false
+// git status: one running at a time (busy), and when the last one started
+const gitReads = { busy: false, startedAt: 0 }
+// the account's GitHub REST quota (rate_limit itself costs none of it); stale: the last check failed,
+// so the reading on show is an old one
+let ghReading: { quota?: GhQuota; stale: boolean } = { stale: false }
 let ghBin: string | null | undefined
 const GH_EVERY_TICKS = 120
 const GH_JQ = '[.resources.core.remaining, .resources.core.limit, .resources.core.reset] | @tsv'
@@ -126,26 +112,79 @@ let lastNote = ''
 const LOUD = 50
 // cells between the band's parts: room to breathe
 const GAP = 2
+// the /cache pane's rows drawn around the turn table, so the table takes what is left:
+// always the title 1, the clock 2, the advice 2, the table's head 2 and the footer 6
+const PANE_FIXED_ROWS = 1 + 2 + 2 + 2 + 6
+// the life bar under the clock, while it counts down
+const PANE_LIFE_BAR_ROWS = 1
+// once a request has landed: its model line under the advice, and the stack 3
+const PANE_LAST_REQUEST_ROWS = 1 + 3
+// the table shows at least this many turns, however short the pane
+const PANE_MIN_TABLE_ROWS = 3
+
+/** What belongs to one conversation: /clear and a resume start it over, the account's figures stay. */
+type Conversation = {
+  // the last KEEP main-loop requests
+  samples: Sample[]
+  // the whole conversation's reads, writes, uncached input and misses, beyond the KEEP samples
+  totals: SessionTotals
+  // each turn's number in the conversation, counted apart from the samples
+  turnNo: Map<string, number>
+  // the lifetime in force and why: what the requests' timing showed (observed), else baseTtl
+  ttl: Ttl
+  ttlSource: string
+  observed: Ttl | undefined
+  // what the clock last drew, so it redraws only on a change
+  lastKey: string
+  // the countdown toasts: the request whose cache entry they count down, and the mark last fired
+  toast: { startedAt: number; level: number }
+  // the tools the main loop ran, and the skills it loaded by name, with how often
+  tally: ToolTally
+  skills: Map<string, number>
+  // what the conversation has cost so far, and the figures at the start of the current turn, so the turn's share shows
+  costUsd: number | undefined
+  turnBase: { usd?: number; five?: number; week?: number } | undefined
+}
+
+const startConversation = (): Conversation => ({
+  samples: [],
+  totals: emptyTotals(),
+  turnNo: new Map(),
+  ttl: baseTtl,
+  ttlSource: envSource,
+  observed: undefined,
+  lastKey: '',
+  toast: { startedAt: 0, level: Infinity },
+  tally: new Map(),
+  skills: new Map(),
+  costUsd: undefined,
+  turnBase: undefined,
+})
+
+let conv = startConversation()
 
 /**
- * Re-reads the session's figures. No hook awaits it: the HUD draws the latest
+ * Re-reads the session's figures (git, usage, the model), re-picks the cache
+ * lifetime from them and redraws. No hook awaits it: the HUD draws the latest
  * reading and redraws when a new one lands. git status runs apart, one at a
  * time, so a slow or locked repo holds back neither a hook nor the other figures.
  */
-async function refreshInfo($: EngineInterface, withBranch = false) {
-  readGit($, withBranch)
-  await readUsage($)
+async function rereadAndRedraw($: EngineInterface, gitNow = false): Promise<void> {
+  readGitStatus($, gitNow)
+  await readUsageFigures($)
   model = prettyModel(await $.session.model().catch(() => model))
+  recomputeTtl()
+  $.ui.invalidate('ui.render')
 }
 
 /** Cost, context and the plan windows, off the engine (no git): quick enough for turn.start to wait on. */
-async function readUsage($: EngineInterface) {
-  const n = ++usageAsked
+async function readUsageFigures($: EngineInterface) {
+  const n = ++usageReads.asked
   const u = await $.session.usage().catch(() => undefined)
-  if (u && n > usageApplied) {
-    usageApplied = n
+  if (u && n > usageReads.applied) {
+    usageReads.applied = n
     ctxPct = u.context.percent
-    costUsd = u.cost?.usd
+    conv.costUsd = u.cost?.usd
     const win = (kind: string): Window | undefined => {
       const r = u.rateLimits.find(l => l.kind === kind)
       return r ? { pct: r.percentUsed, resetsAt: r.resetsAt ? Date.parse(r.resetsAt) : undefined } : undefined
@@ -157,10 +196,11 @@ async function readUsage($: EngineInterface) {
   }
 }
 
-function readGit($: EngineInterface, force: boolean) {
-  if (gitBusy || (!force && Date.now() - branchReadAt <= 30_000)) return
-  gitBusy = true
-  branchReadAt = Date.now()
+/** git status in the background, one at a time and at most every 30 s unless `force`d. */
+function readGitStatus($: EngineInterface, force: boolean) {
+  if (gitReads.busy || (!force && Date.now() - gitReads.startedAt <= 30_000)) return
+  gitReads.busy = true
+  gitReads.startedAt = Date.now()
   // --no-optional-locks: a status run in the background must not take index.lock from the agent's own git commands
   void $.process
     .run(['git', '--no-optional-locks', 'status', '--porcelain', '-b'], { timeoutMs: 10_000 })
@@ -173,48 +213,30 @@ function readGit($: EngineInterface, force: boolean) {
       () => undefined,
     )
     .finally(() => {
-      gitBusy = false
+      gitReads.busy = false
     })
 }
 
 /** Which lifetime Claude Code asks for now, from the option, the environment, the setting and the account. */
-function retune() {
+function recomputeTtl() {
   const choice = decideTtl(ttlOption, env, setting, account)
   baseTtl = choice.ttl
   envSource = choice.source
-  if (observed === undefined) {
-    ttl = baseTtl
-    ttlSource = envSource
+  if (conv.observed === undefined) {
+    conv.ttl = baseTtl
+    conv.ttlSource = envSource
   }
-}
-
-/** The session's figures re-read in the background, then redrawn: no hook waits on them. */
-function refresh($: EngineInterface, withBranch = false): Promise<void> {
-  return refreshInfo($, withBranch).then(() => {
-    retune()
-    $.ui.invalidate('ui.render')
-  })
 }
 
 /** A conversation of its own: its cache, its requests, its turns and its activity start over. */
 function newConversation() {
-  samples = []
-  lastKey = ''
-  toastedFor = 0
-  toastLevel = Infinity
-  observed = undefined
-  ttl = baseTtl
-  ttlSource = envSource
-  tally = new Map()
-  skills = new Map()
-  turnNo = new Map()
-  turnBase = undefined
-  // the old conversation's cost is not this one's, and neither is a reading still on its way
-  costUsd = undefined
-  usageApplied = usageAsked
+  conv = startConversation()
+  // a usage reading still on its way is the old conversation's
+  usageReads.applied = usageReads.asked
 }
 
-async function refreshGh($: EngineInterface) {
+/** The account's GitHub REST quota, through gh: found once on the usual paths, then asked each time. */
+async function readGhQuota($: EngineInterface) {
   if (ghBin === undefined) {
     ghBin = null
     for (const bin of GH_PATHS) {
@@ -230,13 +252,11 @@ async function refreshGh($: EngineInterface) {
   // exit 4, or gh asking for `gh auth login`: no token at all, which the gauge says as it does for the anonymous 60
   const noLogin = ran !== undefined && (ran.exitCode === 4 || /gh auth login/.test(`${ran.stdout}\n${ran.stderr}`))
   const quota: GhQuota | undefined = ran?.exitCode === 0 ? parseRateLimit(ran.stdout) : noLogin ? { anon: true } : undefined
-  if (quota) {
-    ghQuota = quota
-    ghStale = false
-  } else if (ghQuota) {
+  const old = ghReading.quota
+  if (quota) ghReading = { quota, stale: false }
+  else if (old) {
     // a failed or timed-out check keeps the last reading, marked as old, until its window resets
-    ghStale = true
-    if (!ghQuota.anon && Date.now() >= ghQuota.resetsAt) ghQuota = undefined
+    ghReading = { quota: !old.anon && Date.now() >= old.resetsAt ? undefined : old, stale: true }
   }
 }
 
@@ -264,11 +284,11 @@ function fitsRow([l, r]: [BandPart[], BandPart[]], width: number): boolean {
 const LABEL_PAD = 'Context'.length
 
 function current(policy: Policy, now: number) {
-  const last = samples[samples.length - 1]
-  const prev = samples[samples.length - 2]
+  const last = conv.samples[conv.samples.length - 1]
+  const prev = conv.samples[conv.samples.length - 2]
   const disabled = last ? isCachingDisabled(last.model, env) : isCachingDisabled('', env)
-  const advice: Advice = advise(last, prev, { ttl, ...policy }, now, disabled)
-  const left = last ? remainingMs(last, ttl, now) : 0
+  const advice: Advice = advise(last, prev, { ttl: conv.ttl, ...policy }, now, disabled)
+  const left = last ? remainingMs(last, conv.ttl, now) : 0
   return { last, advice, left }
 }
 
@@ -333,11 +353,11 @@ function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: P
   // row one, right: the cache, its hit rate and how long it stays warm
   const state = shortAdvice(advice, last ? fmtTokens(promptTokens(last)) : undefined)
   // the session's hit rate and misses: the last request alone sits near 100% in any long conversation
-  const sessionHitRatio = sessionHit(samples)
-  const misses = countMisses(samples, ttl)
+  const sessionHitRatio = totalsHit(conv.totals)
+  const misses = conv.totals.misses
   const ratio = sessionHitRatio
   const counting = !!last && advice.kind !== 'uncached' && advice.kind !== 'off'
-  const lifeC = counting ? (left > 0 ? lifeColor(left, ttl, policy.warnMs) : 'red') : undefined
+  const lifeC = counting ? (left > 0 ? lifeColor(left, conv.ttl, policy.warnMs) : 'red') : undefined
   const hitC = ratio >= 0.8 ? 'green' : ratio >= 0.4 ? 'yellow' : 'red'
   // ● Cache 1h ████████████ 59m  hit 76%  misses 1   (the dot and the bar drain green, yellow, red; ○ cold once lapsed)
   const cache = (width: number, words = true, pad = 0): BandPart[] => {
@@ -346,8 +366,8 @@ function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: P
     const segs: BandSeg[] = [dot, label('Cache', pad)]
     if (lapsed) segs.push({ text: 'cold', color: 'red', bold: true })
     else if (counting) {
-      segs.push({ text: `${ttl} `, color: lifeC })
-      if (width > 0) segs.push(...lineGauge(lifeRatio(left, ttl), width, lifeC), { text: ' ' })
+      segs.push({ text: `${conv.ttl} `, color: lifeC })
+      if (width > 0) segs.push(...lineGauge(lifeRatio(left, conv.ttl), width, lifeC), { text: ' ' })
       segs.push({ text: fmtShort(left), color: lifeC, bold: true })
     }
     if (last) {
@@ -368,11 +388,12 @@ function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: P
   // GitHub's REST quota used, like the plan windows; no token says so instead of showing the anonymous 60
   // an old reading (the last check failed) carries a grey ?, and says nothing once its window has reset
   const gh = (width: number, pad = 0): BandPart[] => {
-    if (!ghQuota) return []
-    if (ghQuota.anon) return [part('gh', [label('GH', pad), { text: '未登入', color: 'gray' }])]
-    if (!ghStale) return meter('gh', 'GH', ghQuota.pct, width, SCALE.window, ghQuota.resetsAt, pad)
-    if (now >= ghQuota.resetsAt) return []
-    return meter('gh', 'GH', ghQuota.pct, width, SCALE.window, undefined, pad).map(p => part(p.key, [...(p.segs ?? []), { text: ' ?', color: 'gray' }]))
+    const { quota, stale } = ghReading
+    if (!quota) return []
+    if (quota.anon) return [part('gh', [label('GH', pad), { text: '未登入', color: 'gray' }])]
+    if (!stale) return meter('gh', 'GH', quota.pct, width, SCALE.window, quota.resetsAt, pad)
+    if (now >= quota.resetsAt) return []
+    return meter('gh', 'GH', quota.pct, width, SCALE.window, undefined, pad).map(p => part(p.key, [...(p.segs ?? []), { text: ' ?', color: 'gray' }]))
   }
   const gauges = (width: number, withWeek = true) => [
     ...meter('ctx', 'Context', ctxPct, width, SCALE.context),
@@ -383,7 +404,7 @@ function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: P
 
   // row two, right: the tools the main loop ran
   // the activity: tools by use (skills apart), then the skills by name
-  const toolsOnly: ToolTally = new Map([...tally].filter(([name]) => name !== 'Skill'))
+  const toolsOnly: ToolTally = new Map([...conv.tally].filter(([name]) => name !== 'Skill'))
   const tools = (n: number, pad = 0): BandPart[] => {
     const list = topTools(toolsOnly, n)
     if (list.length === 0) return []
@@ -397,13 +418,13 @@ function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: P
     ]
   }
   const skillList = (n: number, pad = 0): BandPart[] => {
-    const list = [...skills].sort((a, b) => b[1] - a[1]).slice(0, n)
+    const list = [...conv.skills].sort((a, b) => b[1] - a[1]).slice(0, n)
     if (list.length === 0) return []
     return [
       part('skills', [
         label('Skills', pad),
         ...list.flatMap(([name, count], i) => [{ text: `${i ? '  ' : ''}${name}`, color: 'magenta' }, ...(count > 1 ? [{ text: `×${count}`, color: 'gray' }] : [])]),
-        ...(skills.size > n ? [{ text: `  +${skills.size - n}`, color: 'gray' }] : []),
+        ...(conv.skills.size > n ? [{ text: `  +${conv.skills.size - n}`, color: 'gray' }] : []),
       ]),
     ]
   }
@@ -418,14 +439,14 @@ function drawHud($: EngineInterface, e: ResolveInput, columns: number, policy: P
   }
 
   // what the current (or last) turn spent: dollars, and its share of the 5-hour window; the session's total beside it
-  const spent = turnSpend(turnBase, costUsd, five?.pct, week?.pct)
+  const spent = turnSpend(conv.turnBase, conv.costUsd, five?.pct, week?.pct)
   const spend = (withSession: boolean, pad = 0): BandPart[] => {
     if (!spent) return []
     const segs: BandSeg[] = [label('Turn', pad)]
     if (spent.usd !== undefined) segs.push({ text: fmtUsd(spent.usd), color: '#c0caf5', bold: true })
     if (spent.five !== undefined) segs.push({ text: `${segs.length > 1 ? ' ' : ''}+${spent.five.toFixed(1)}%`, color: deltaColor(spent.five) })
     if (segs.length === 1) return []
-    if (withSession && costUsd !== undefined) segs.push({ text: '  ' }, label('Session'), { text: fmtUsd(costUsd), color: 'gray' })
+    if (withSession && conv.costUsd !== undefined) segs.push({ text: '  ' }, label('Session'), { text: fmtUsd(conv.costUsd), color: 'gray' })
     return [part('spend', segs)]
   }
 
@@ -529,7 +550,7 @@ export const register: Register = (on, options) => {
     }
     pinned = options.ttl === '5m' || options.ttl === '1h'
     setting = await readSetting($)
-    retune()
+    recomputeTtl()
 
     await $.command
       .register({
@@ -543,15 +564,15 @@ export const register: Register = (on, options) => {
     cwd = e.cwd
     home = await $.env.get('HOME').catch(() => undefined)
     // the account (and with it the lifetime) is known once the first reading lands
-    void refresh($, true).then(() => $.ui.log(`prompt-glance loaded: ${ttl} cache (${ttlSource}), /${COMMAND} opens the table`, { to: 'debug' }))
+    void rereadAndRedraw($, true).then(() => $.ui.log(`prompt-glance loaded: ${conv.ttl} cache (${conv.ttlSource}), /${COMMAND} opens the table`, { to: 'debug' }))
     void note($, `start ${e.isInteractive ? 'interactive' : 'headless'} ${below ? 'below' : 'above'}`)
-    if (e.isInteractive) void refreshGh($).then(() => $.ui.invalidate('ui.render'))
+    if (e.isInteractive) void readGhQuota($).then(() => $.ui.invalidate('ui.render'))
 
     let ticks = 0
     timer?.cancel()
     timer = $.clock.every(1000, () => {
-      if (e.isInteractive && ticks % GH_EVERY_TICKS === GH_EVERY_TICKS - 1) void refreshGh($).then(() => $.ui.invalidate('ui.render'))
-      if (++ticks % 5 === 0) void refresh($)
+      if (e.isInteractive && ticks % GH_EVERY_TICKS === GH_EVERY_TICKS - 1) void readGhQuota($).then(() => $.ui.invalidate('ui.render'))
+      if (++ticks % 5 === 0) void rereadAndRedraw($)
       // the model every second: a /model switch shows at once, not on the next request
       else
         void $.session
@@ -567,21 +588,21 @@ export const register: Register = (on, options) => {
       const now = Date.now()
       const { last, advice, left } = current(policy, now)
       const key = `${advice.kind}|${advice.text}|${left > 0 ? fmtClock(left) : ''}`
-      if (key !== lastKey) {
-        lastKey = key
+      if (key !== conv.lastKey) {
+        conv.lastKey = key
         if (showStatus) $.ui.status(shortLine(policy, now))
         $.ui.invalidate('ui.render')
       }
       if (wantToast && last && left > 0 && promptTokens(last) >= TOAST_MIN_TOKENS) {
-        if (toastedFor !== last.startedAt) {
-          toastedFor = last.startedAt
-          toastLevel = Infinity
+        if (conv.toast.startedAt !== last.startedAt) {
+          conv.toast.startedAt = last.startedAt
+          conv.toast.level = Infinity
         }
         // the first toast comes at warnSeconds, then 10, 3, 2 and 1 seconds; a late tick skips to the newest one
         const secs = Math.ceil(left / 1000)
-        const mark = nextToastMark(secs, policy.warnMs / 1000, toastLevel)
+        const mark = nextToastMark(secs, policy.warnMs / 1000, conv.toast.level)
         if (mark !== undefined) {
-          toastLevel = mark
+          conv.toast.level = mark
           const tail = secs <= COUNTDOWN_MARKS[0] ? 'send a message now' : `send a message to keep ${fmtTokens(promptTokens(last))} tokens warm`
           $.ui.toast(`cache expires in ${secs >= 60 ? fmtClock(left) : `${secs}s`}: ${tail}`)
         }
@@ -594,14 +615,14 @@ export const register: Register = (on, options) => {
     void note($, `end ${e.reason}`)
     // /clear and a resume carry on in this process with another conversation, and another cache: start over, and
     // keep the clock (no session.start follows). An exit, a logout or the end of a -p run takes the clock with the process.
-    const fresh = e.reason !== 'prompt_input_exit' && e.reason !== 'logout' && e.reason !== 'other'
-    if (fresh) {
+    const processGoesOn = e.reason !== 'prompt_input_exit' && e.reason !== 'logout' && e.reason !== 'other'
+    if (processGoesOn) {
       newConversation()
       $.ui.invalidate('ui.render')
     }
     const r = await next(e)
     // read once the engine is done with the old conversation
-    if (fresh) void refresh($)
+    if (processGoesOn) void rereadAndRedraw($)
     return r
   })
 
@@ -612,10 +633,10 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) return next(e)
     // a reading taken now, not the cached one: that may predate the last turn's spending or a /clear.
     // Only the engine's usage call is awaited; git stays in the background
-    await readUsage($)
+    await readUsageFigures($)
     const r = await next(e)
-    turnBase = { usd: costUsd, five: five?.pct, week: week?.pct }
-    void refresh($)
+    conv.turnBase = { usd: conv.costUsd, five: five?.pct, week: week?.pct }
+    void rereadAndRedraw($)
     $.ui.invalidate('ui.render')
     return r
   })
@@ -625,7 +646,7 @@ export const register: Register = (on, options) => {
     const startedAt = await $.clock.now().catch(() => Date.now())
     const r = yield* next(e)
     if (r.usage) {
-      const prev = samples[samples.length - 1]
+      const prev = conv.samples[conv.samples.length - 1]
       const cur: Sample = {
         turnId: e.turnId,
         index: e.index,
@@ -636,22 +657,23 @@ export const register: Register = (on, options) => {
         fresh: r.usage.input_tokens,
         output: r.usage.output_tokens,
       }
-      samples.push(cur)
-      if (samples.length > KEEP) samples = samples.slice(-KEEP)
-      if (!turnNo.has(e.turnId)) turnNo.set(e.turnId, turnNo.size + 1)
+      conv.totals = addToTotals(conv.totals, prev, cur, conv.ttl)
+      conv.samples.push(cur)
+      if (conv.samples.length > KEEP) conv.samples = conv.samples.slice(-KEEP)
+      if (!conv.turnNo.has(e.turnId)) conv.turnNo.set(e.turnId, conv.turnNo.size + 1)
       if (!pinned) {
-        // the account as last read; the refresh below re-reads it and retunes
-        retune()
-        const seen = observeTtl(prev, cur, observed)
-        if (seen !== observed) {
-          observed = seen
-          ttl = seen ?? baseTtl
-          ttlSource = `observed from request timing; ${envSource} said ${baseTtl}`
-          $.ui.log(`prompt-glance: cache lifetime is ${ttl} (${ttlSource})`, { to: 'debug' })
+        // the account as last read; the re-read below reads it again and recomputes
+        recomputeTtl()
+        const seen = observeTtl(prev, cur, conv.observed)
+        if (seen !== conv.observed) {
+          conv.observed = seen
+          conv.ttl = seen ?? baseTtl
+          conv.ttlSource = `observed from request timing; ${envSource} said ${baseTtl}`
+          $.ui.log(`prompt-glance: cache lifetime is ${conv.ttl} (${conv.ttlSource})`, { to: 'debug' })
         }
       }
-      lastKey = ''
-      void refresh($)
+      conv.lastKey = ''
+      void rereadAndRedraw($)
       if (showStatus) $.ui.status(shortLine(policy, Date.now()))
       $.ui.invalidate('ui.render')
     }
@@ -662,13 +684,13 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const r = await next(e)
     if (!e.agentId) {
-      const c = tally.get(e.tool) ?? { ok: 0, failed: 0 }
+      const c = conv.tally.get(e.tool) ?? { ok: 0, failed: 0 }
       if ('deny' in r && r.deny !== undefined) c.failed += 1
       else if (r.isError) c.failed += 1
       else c.ok += 1
-      tally.set(e.tool, c)
+      conv.tally.set(e.tool, c)
       const name = e.tool === 'Skill' ? (e as { skill?: unknown }).skill : undefined
-      if (typeof name === 'string' && name) skills.set(name, (skills.get(name) ?? 0) + 1)
+      if (typeof name === 'string' && name) conv.skills.set(name, (conv.skills.get(name) ?? 0) + 1)
       $.ui.invalidate('ui.render')
     }
     return r
@@ -684,7 +706,7 @@ export const register: Register = (on, options) => {
     await $.ui.open({ id: PANE, title: 'cache', focus: true })
     $.ui.invalidate('ui.render')
     const { advice } = current(policy, Date.now())
-    return { text: `${ttl} cache (${ttlSource}) · ${advice.text} · /${COMMAND} stop closes` }
+    return { text: `${conv.ttl} cache (${conv.ttlSource}) · ${advice.text} · /${COMMAND} stop closes` }
   })
 
   on('ui.close', async ($, e, next) => {
@@ -751,10 +773,10 @@ export const register: Register = (on, options) => {
     const sp = (t: string) => (e.surface === 'terminal' ? t : t.replace(/ /g, ' '))
     const now = Date.now()
     const { last, advice, left } = current(policy, now)
-    const all = byTurn(samples)
+    const all = byTurn(conv.samples)
     const counting = !!last && advice.kind !== 'uncached' && advice.kind !== 'off'
     // the countdown goes green, then yellow, then red as the cache runs out
-    const clockColor = counting ? lifeColor(left, ttl, policy.warnMs) : undefined
+    const clockColor = counting ? lifeColor(left, conv.ttl, policy.warnMs) : undefined
     const stateColor = advice.kind === 'expired' || advice.kind === 'miss' ? 'red' : (clockColor ?? COLOR[advice.kind])
     const hitColor = (pct: number) => (pct >= 80 ? 'green' : pct >= 40 ? 'yellow' : 'red')
     // solid bars are filled Boxes, not block characters, so HTML draws no seams between cells
@@ -770,20 +792,19 @@ export const register: Register = (on, options) => {
     )
 
     const barW = Math.min(width, 40)
-    const life = lifeRatio(left, ttl)
+    const life = lifeRatio(left, conv.ttl)
     const lifeFilled = Math.round(life * barW)
     const [sr, sw, sn] = last ? segments(last.read, last.write, last.fresh, barW) : [0, 0, 0]
-    // the latest turns that fit in the pane's own room, after the rows drawn around the table:
-    // title 1, clock 2 (+1 bar), advice 2 (+1 model), stack 3, table head 2, footer 6
-    const around = 13 + (counting ? 1 : 0) + (last ? 4 : 0)
-    const rows = all.slice(-Math.max(3, e.props.scroll.bodyRows - around))
+    // the latest turns that fit in the pane's own room, after the rows drawn around the table
+    const around = PANE_FIXED_ROWS + (counting ? PANE_LIFE_BAR_ROWS : 0) + (last ? PANE_LAST_REQUEST_ROWS : 0)
+    const rows = all.slice(-Math.max(PANE_MIN_TABLE_ROWS, e.props.scroll.bodyRows - around))
     const icon = advice.kind === 'warm' ? '●' : advice.kind === 'soon' ? '▲' : advice.kind === 'expired' || advice.kind === 'miss' ? '✖' : '○'
 
     return (
       <Box flexDirection="column">
         <Box key="title" flexDirection="row" columnGap={1}>
           <Text bold color="cyan">{sp('⚡ PROMPT CACHE')}</Text>
-          <Text dimColor>{sp(`· ${ttl} lifetime (${ttlSource})`)}</Text>
+          <Text dimColor>{sp(`· ${conv.ttl} lifetime (${conv.ttlSource})`)}</Text>
         </Box>
 
         <Box key="clock" flexDirection="column" marginTop={1}>
@@ -826,7 +847,7 @@ export const register: Register = (on, options) => {
           </Box>
           {rows.length === 0 ? <Text dimColor>{sp('no requests yet')}</Text> : null}
           {rows.map((row, i) => {
-            const n = turnNo.get(row.turnId) ?? all.length - rows.length + i + 1
+            const n = conv.turnNo.get(row.turnId) ?? all.length - rows.length + i + 1
             const pct = Math.round(rowRatio(row) * 100)
             return (
               <Box key={`t:${row.turnId}`} flexDirection="row" columnGap={1}>
