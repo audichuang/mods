@@ -33,7 +33,8 @@ WRAP = (r'(?:\w+=\S*\s+'
         r'|(?:nohup|sudo|time|command|exec)\s+)*')
 POS = SEP + WRAP
 # gh, also by path, with -R/--repo wherever gh accepts it (before or after the command group).
-GH = r'(?:[^\s;&|()<>\'"`]*/)?gh'
+PATH_PREFIX = r'(?:[^\s;&|()<>\'"`]*/)?'  # a command called by path: /opt/homebrew/bin/gh
+GH = PATH_PREFIX + r'gh'
 REPO = r'(?:\s+(?:-R\s*|--repo(?:\s+|=))[^\s;&|]+)*'
 WATCH = re.compile(POS + GH + REPO + r'\s+run' + REPO + r'\s+watch\b')
 CHECKS = re.compile(POS + GH + REPO + r'\s+pr' + REPO + r'\s+checks\b[^;&|\n]*--watch')
@@ -67,7 +68,7 @@ AUTH = re.compile(r'(?i)authorization:|\$\(gh auth token\)|\$\{?(?:GITHUB_TOKEN|
 # Wrappers whose quoted argument is itself a command line (sh -c, ssh host, eval): their
 # loops are hidden from loops(), so reason() runs again on the unquoted argument. Group w
 # starts at the wrapper itself; it only counts when that spot is shell code (see code_mask).
-PAYLOAD = re.compile(SEP + r'(?P<w>' + WRAP + r'(?:(?:[^\s;&|()<>\'"`]*/)?(?:ba|z|da|k)?sh(?:\s+-[\w-]+)*\s+|'
+PAYLOAD = re.compile(SEP + r'(?P<w>' + WRAP + r'(?:' + PATH_PREFIX + r'(?:ba|z|da|k)?sh(?:\s+-[\w-]+)*\s+|'
                      + SSH + r'\s+|eval\s+))(?P<q>\'[^\']*\'|"(?:\\.|[^"\\])*")')
 HEREDOC = re.compile(r'<<(-)?\s*([\'"]?)(\w+)\2')
 CODE, QUOTE, HEREDOC_BODY = 0, 1, 2
@@ -257,9 +258,9 @@ def reason(cmd, depth=0):
         if not all(lits):
             return ('sleep 的間隔是變數或算式，hook 看不出有沒有至少 60 秒；'
                     '用迴圈輪詢 gh 會吃光共用的 5000/hr GitHub 額度。')
-        # `for` over a fixed list and `while read` are batches, not polling; while/until
-        # without sleep spins.
-        if not args and kind in ('while', 'until'):
+        # A `while read` that got here is not a batch (gh ignores what it reads), so without
+        # sleep it spins like while/until; `for` over a fixed list ends by itself.
+        if not args and kind in ('while', 'until', 'read'):
             return '沒有 sleep 的 while／until 迴圈呼叫 gh，會連續狂打共用的 5000/hr GitHub 額度。'
     if depth < MAX_DEPTH:
         for inner in payloads(cmd, mask):

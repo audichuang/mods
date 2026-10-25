@@ -14,7 +14,7 @@
 
 ## 驗證
 
-- push 前跑 `bash scripts/check.sh`（要比對 version 有沒有調就加 `BASE=origin/main`），全綠才推；CI（`.github/workflows/ci.yml`）在 push／PR 跑同一支，每週一另用最新版 Claude Code 跑一次。它包含：marketplace 與每個 plugin 的 `claude plugin validate --strict`、每個 mod 的 `claude plugin test`、官方 strict tsconfig 的 `tsc`、`gh-quota/tests/*.sh`（hook 案例與 gh-wait 假 gh 測試）、shellcheck、manifest 一致性、產生檔沒進 git、改了 plugin 有調 version。
+- push 前跑 `bash scripts/check.sh`（要比對 version 有沒有調就加 `BASE=origin/main`；它只比對已 commit 的改動，先 commit 再跑），全綠才推；CI（`.github/workflows/ci.yml`）在 push／PR 跑同一支，每週一另用最新版 Claude Code 跑一次。它包含：marketplace 與每個 plugin 的 `claude plugin validate --strict`、每個 mod 的 `claude plugin test`、官方 strict tsconfig 的 `tsc`、`gh-quota/tests/*.sh`（hook 案例與 gh-wait 假 gh 測試）、shellcheck、manifest 一致性、產生檔沒進 git、改了 plugin 的 version 有變大。
 - 型別檢查用 repo 裡的 `ci/types/claude-code.d.ts`（`.claude-plugin/types/` 只有 engine 載入時才寫、而且 gitignore，CI 拿不到）。升 Claude Code 後跑 `scripts/sync-types.sh` 同步型別檔和 `ci/claude-version`。`ci/tsc-baseline` 記某個 mod 還沒清掉的舊錯數（目前全清，檔案是空的）：只准變少，修掉就把數字改小。
 - 新增 mod：資料夾裡有 `.claude-plugin/plugin.json` 就會被 check.sh 撿到，`hooks/hooks.json` 有 `modules` 就當 mod 跑 test 和 tsc；`plugin.json` 要有 `author`，不然 `--strict` 不過。
 - 測試環境沒有 `setTimeout`。要測計時器的多個週期用 `claude-code/testing` 的 `mock.clock(on)` 再 `advance`；只測啟動時那次，就自己 `on('clock.every', …)` 回 `{ deny }`。

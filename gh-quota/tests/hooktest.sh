@@ -157,6 +157,8 @@ DENY|ssh -o ProxyCommand="ssh -W %h:%p jump" ubuntu gh run watch 1
 DENY|ssh -o "StrictHostKeyChecking no" ubuntu 'while true; do gh api x; sleep 5; done'
 allow|ssh -o "StrictHostKeyChecking no" ubuntu gh run view 1
 allow|while read r; do gh repo view "$r"; done < repos.txt
+DENY:沒有 sleep|while read r; do gh run view 1; done < list
+DENY:沒有 sleep|tail -f log | while read l; do gh run view 1 --json status; done
 allow|gh issue list --json number -q ".[].number" | while read n; do gh issue view $n; done
 allow|while IFS= read -r r; do gh api "repos/$r"; done < repos.txt
 allow|while read l; do echo "gh is $l"; done < f
