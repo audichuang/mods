@@ -1,6 +1,6 @@
 {
   "name": "prompt-glance",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "A two-row HUD above the Claude Code prompt: model, path and git branch, context, plan-window and GitHub API quota gauges that warm from green to red, prompt-cache hit rate with a live countdown to expiry, and the tools and skills in use. Folds to fewer rows on a narrow terminal. /cache opens a per-turn cache table.",
   "author": {
     "name": "audichuang",

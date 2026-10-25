@@ -6,6 +6,7 @@ import {
   segments,
   observeTtl,
   decideTtl,
+  isAccountDefault,
   accountOf,
   nextToastMark,
   bar,
@@ -165,6 +166,8 @@ let gitRun: (() => Promise<unknown>) | undefined
 let usageHold: Promise<unknown> | undefined
 // set once the held answer has gone back to the module
 let usageHeldOut = false
+// holds back the next turn.step answer until the promise settles: a request still streaming
+let stepHold: Promise<unknown> | undefined
 
 function fakeEngine(
   on: On,
@@ -179,6 +182,7 @@ function fakeEngine(
   gitRun = undefined
   usageHold = undefined
   usageHeldOut = false
+  stepHold = undefined
   ghRate = ''
   modelId = 'claude-opus-5-5'
   ghExit = { exitCode: 0, stderr: '' }
@@ -226,6 +230,9 @@ function fakeEngine(
     return { value: undefined }
   })
   on('turn.step', async function* ($, e) {
+    const hold = stepHold
+    stepHold = undefined
+    if (hold) await hold
     return {
       turnId: e.turnId,
       index: e.index,
@@ -595,6 +602,16 @@ describe('which lifetime Claude Code asks for', () => {
     expect(decideTtl('auto', {}, undefined, 'credits').ttl).toBe('5m')
     expect(decideTtl('auto', {}, undefined, 'other').ttl).toBe('5m')
     expect(decideTtl('1h', { force5m: '1' }, '5m', 'other').ttl).toBe('1h')
+  })
+  test('only an account default may be overruled by request timing', () => {
+    expect(isAccountDefault(decideTtl('auto', {}, undefined, 'subscription'))).toBe(true)
+    expect(isAccountDefault(decideTtl('auto', {}, undefined, 'credits'))).toBe(true)
+    expect(isAccountDefault(decideTtl('auto', {}, undefined, 'other'))).toBe(true)
+    expect(isAccountDefault(decideTtl('5m', {}, undefined, 'subscription'))).toBe(false)
+    expect(isAccountDefault(decideTtl('auto', { force5m: '1' }, undefined, 'subscription'))).toBe(false)
+    expect(isAccountDefault(decideTtl('auto', { ttlVar: '5m' }, undefined, 'subscription'))).toBe(false)
+    expect(isAccountDefault(decideTtl('auto', {}, '5m', 'subscription'))).toBe(false)
+    expect(isAccountDefault(decideTtl('auto', { enable1h: '1' }, undefined, 'other'))).toBe(false)
   })
   test('the account comes from the plan windows the last response reported', () => {
     expect(accountOf([])).toBe('other')
@@ -979,6 +996,128 @@ describe('the clock', () => {
     const reply = await $.command.run({ command: 'cache', args: '' } as never)
     expect((reply as { text: string }).text).toMatch(/^1h cache \(observed from request timing; default said 5m\)/)
   })
+
+  test('a subscription that runs out of plan usage counts down 5 minutes again, over the hour its traffic showed', { options: { warnSeconds: 300 } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [], toasts: [] }
+    // the first request 20 minutes ago, by the clock requests are timed by
+    const clock = mock.clock(on, { now: Date.now() - 20 * 60_000 })
+    const limits = [{ kind: 'five_hour', percentUsed: 40 }]
+    fakeEngine(on, {}, calls, undefined, limits, undefined, { clock: false })
+    await $.session.start(START)
+    await clock.advance(1000)
+    await step($)
+    await clock.set(Date.now())
+    // a hit 20 minutes on: the traffic shows the hour
+    await step($, { turnId: 't2' })
+    await clock.advance(1000)
+    let ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^1h $/ })).toBeDefined()
+    await ui.unmount()
+    expect(calls.toasts).toEqual([])
+
+    // the 5-hour window fills: requests now draw on usage credits, whose cache lives 5 minutes
+    limits[0] = { kind: 'five_hour', percentUsed: 100 }
+    await clock.advance(10_000)
+    ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^5m $/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^1h $/ })).toBeUndefined()
+    await ui.unmount()
+    expect(calls.toasts).toEqual([expect.stringMatching(/^cache expires in [45]:\d\d: send a message to keep 81\.3k tokens warm$/)])
+  })
+
+  test('a request still streaming when the account switches to usage credits is no evidence for the hour', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() - 21 * 60_000 })
+    const limits = [{ kind: 'five_hour', percentUsed: 40 }]
+    fakeEngine(on, {}, calls, undefined, limits, undefined, { clock: false })
+    on('command.run', () => ({ text: '' }) as never)
+    await $.session.start(START)
+    await clock.advance(1000)
+    // request A, done under the subscription
+    await step($)
+    await clock.advance(10_000)
+    // request B starts under the subscription and is still streaming when the 5-hour window fills
+    let release = () => {}
+    stepHold = new Promise<void>(r => (release = r))
+    const streaming = step($, { turnId: 't2' })
+    await clock.settle()
+    limits[0] = { kind: 'five_hour', percentUsed: 100 }
+    await clock.advance(10_000)
+    release()
+    await streaming
+    await clock.advance(1000)
+    const switched = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((switched as { text: string }).text).toMatch(/^5m cache \(usage credits default\)/)
+    await $.command.run({ command: 'cache', args: 'stop' } as never)
+    // 20 minutes on, a hit on the entry B wrote with the subscription's hour: no proof for credits
+    await clock.set(Date.now())
+    await step($, { turnId: 't3' })
+    await clock.advance(1000)
+    const reply = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((reply as { text: string }).text).toMatch(/^5m cache \(usage credits default\)/)
+  })
+
+  test('after the switch to usage credits, a hit on the entry the subscription wrote proves no hour', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() - 40 * 60_000 })
+    const limits = [{ kind: 'five_hour', percentUsed: 40 }]
+    fakeEngine(on, {}, calls, undefined, limits, undefined, { clock: false })
+    on('command.run', () => ({ text: '' }) as never)
+    await $.session.start(START)
+    await clock.advance(1000)
+    await step($)
+    await clock.set(Date.now() - 20 * 60_000)
+    // a hit 20 minutes on: the hour shows
+    await step($, { turnId: 't2' })
+    limits[0] = { kind: 'five_hour', percentUsed: 100 }
+    await clock.advance(10_000)
+    const switched = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((switched as { text: string }).text).toMatch(/^5m cache \(usage credits default\)/)
+    await $.command.run({ command: 'cache', args: 'stop' } as never)
+    // 20 minutes later a hit, but on the entry the last subscription request wrote with its hour: no proof for credits
+    await clock.set(Date.now())
+    await step($, { turnId: 't3' })
+    await clock.advance(1000)
+    const ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^5m $/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^1h $/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  for (const [name, env, setting] of [
+    ['CLAUDE_CODE_PROMPT_CACHE_TTL', { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }, undefined],
+    ['FORCE_PROMPT_CACHING_5M', { FORCE_PROMPT_CACHING_5M: '1' }, undefined],
+    ['the promptCacheTtl setting', {}, '5m'],
+  ] as const) {
+    test(`5m pinned by ${name} stays 5m whatever the traffic shows`, async ($, on) => {
+      const calls: Calls = { status: [], logs: [] }
+      let at = Date.now() - 20 * 60_000
+      on('clock.now', () => ({ value: at }) as never)
+      fakeEngine(on, env, calls)
+      if (setting) on('settings.read', () => ({ value: { promptCacheTtl: setting } }) as never)
+      on('command.run', () => ({ text: '' }) as never)
+      await $.session.start(START)
+      await step($)
+      at = Date.now()
+      await step($, { turnId: 't2' })
+      const reply = await $.command.run({ command: 'cache', args: '' } as never)
+      expect((reply as { text: string }).text).toMatch(new RegExp(`^5m cache \\(${name}\\)`))
+    })
+  }
+
+  test('5m pinned by the ttl option stays 5m whatever the traffic shows', { options: { ttl: '5m' } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    let at = Date.now() - 20 * 60_000
+    on('clock.now', () => ({ value: at }) as never)
+    fakeEngine(on, {}, calls)
+    on('command.run', () => ({ text: '' }) as never)
+    await $.session.start(START)
+    await step($)
+    at = Date.now()
+    await step($, { turnId: 't2' })
+    const reply = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((reply as { text: string }).text).toMatch(/^5m cache \(the ttl option\)/)
+  })
 })
 
 describe('/cache', () => {
@@ -1046,6 +1185,20 @@ describe('/cache', () => {
 })
 
 describe('the band gives way', () => {
+  test('to the /cache pane a hot reload left open', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    engineDraws(on)
+    // /reload-plugins: the module starts over, the engine still has the pane up, and session.start runs again
+    on('ui.panes', () => ({ value: [{ id: 'cache', title: 'cache', isShown: true, isFocused: false, isPlaced: true }] }) as never)
+    await $.session.start(START)
+    await step($)
+    const ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^engine$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
   test('to a survey', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls)
