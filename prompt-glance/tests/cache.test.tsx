@@ -166,6 +166,8 @@ let gitRun: (() => Promise<unknown>) | undefined
 let usageHold: Promise<unknown> | undefined
 // set once the held answer has gone back to the module
 let usageHeldOut = false
+// holds back the next turn.step answer until the promise settles: a request still streaming
+let stepHold: Promise<unknown> | undefined
 
 function fakeEngine(
   on: On,
@@ -180,6 +182,7 @@ function fakeEngine(
   gitRun = undefined
   usageHold = undefined
   usageHeldOut = false
+  stepHold = undefined
   ghRate = ''
   modelId = 'claude-opus-5-5'
   ghExit = { exitCode: 0, stderr: '' }
@@ -227,6 +230,9 @@ function fakeEngine(
     return { value: undefined }
   })
   on('turn.step', async function* ($, e) {
+    const hold = stepHold
+    stepHold = undefined
+    if (hold) await hold
     return {
       turnId: e.turnId,
       index: e.index,
@@ -1017,6 +1023,38 @@ describe('the clock', () => {
     expect(await ui.find({ type: 'Text', text: /^1h $/ })).toBeUndefined()
     await ui.unmount()
     expect(calls.toasts).toEqual([expect.stringMatching(/^cache expires in [45]:\d\d: send a message to keep 81\.3k tokens warm$/)])
+  })
+
+  test('a request still streaming when the account switches to usage credits is no evidence for the hour', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() - 21 * 60_000 })
+    const limits = [{ kind: 'five_hour', percentUsed: 40 }]
+    fakeEngine(on, {}, calls, undefined, limits, undefined, { clock: false })
+    on('command.run', () => ({ text: '' }) as never)
+    await $.session.start(START)
+    await clock.advance(1000)
+    // request A, done under the subscription
+    await step($)
+    await clock.advance(10_000)
+    // request B starts under the subscription and is still streaming when the 5-hour window fills
+    let release = () => {}
+    stepHold = new Promise<void>(r => (release = r))
+    const streaming = step($, { turnId: 't2' })
+    await clock.settle()
+    limits[0] = { kind: 'five_hour', percentUsed: 100 }
+    await clock.advance(10_000)
+    release()
+    await streaming
+    await clock.advance(1000)
+    const switched = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((switched as { text: string }).text).toMatch(/^5m cache \(usage credits default\)/)
+    await $.command.run({ command: 'cache', args: 'stop' } as never)
+    // 20 minutes on, a hit on the entry B wrote with the subscription's hour: no proof for credits
+    await clock.set(Date.now())
+    await step($, { turnId: 't3' })
+    await clock.advance(1000)
+    const reply = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((reply as { text: string }).text).toMatch(/^5m cache \(usage credits default\)/)
   })
 
   test('after the switch to usage credits, a hit on the entry the subscription wrote proves no hour', async ($, on) => {

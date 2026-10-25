@@ -126,10 +126,13 @@ const PANE_LAST_REQUEST_ROWS = 1 + 3
 // the table shows at least this many turns, however short the pane
 const PANE_MIN_TABLE_ROWS = 3
 
+/** A main-loop request, and the lifetime generation (Conversation.ttlGen) in force when it started. */
+type Request = Sample & { ttlGen: number }
+
 /** What belongs to one conversation: /clear and a resume start it over, the account's figures stay. */
 type Conversation = {
-  // the last KEEP main-loop requests
-  samples: Sample[]
+  // the last KEEP main-loop requests, each with the lifetime generation it started under
+  samples: Request[]
   // the whole conversation's reads, writes, uncached input and misses, beyond the KEEP samples
   totals: SessionTotals
   // each turn's number in the conversation, counted apart from the samples
@@ -138,9 +141,9 @@ type Conversation = {
   ttl: Ttl
   ttlSource: string
   observed: Ttl | undefined
-  // when the lifetime Claude Code asks for last changed: the start of the latest request before it. An entry that
-  // request (or an earlier one) wrote lives by the old lifetime, so a hit on it says nothing about the new one
-  ttlChangedAfter: number
+  // counts the changes of the lifetime Claude Code asks for. An entry a request wrote lives by the lifetime of the
+  // generation the request started in, so a hit on it says nothing about a later one
+  ttlGen: number
   // what the clock last drew, so it redraws only on a change
   lastKey: string
   // the countdown toasts: the request whose cache entry they count down, and the mark last fired
@@ -160,7 +163,7 @@ const startConversation = (): Conversation => ({
   ttl: baseTtl,
   ttlSource: envSource,
   observed: undefined,
-  ttlChangedAfter: -Infinity,
+  ttlGen: 0,
   lastKey: '',
   toast: { startedAt: 0, level: Infinity },
   tally: new Map(),
@@ -233,7 +236,7 @@ function recomputeTtl() {
   const choice = decideTtl(ttlOption, env, setting, account)
   if (choice.ttl !== baseTtl || choice.source !== envSource) {
     conv.observed = undefined
-    conv.ttlChangedAfter = conv.samples[conv.samples.length - 1]?.startedAt ?? -Infinity
+    conv.ttlGen += 1
   }
   baseTtl = choice.ttl
   envSource = choice.source
@@ -652,10 +655,15 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     if (e.agentId) return yield* next(e)
     const startedAt = await $.clock.now().catch(() => Date.now())
+    // the lifetime generation the request starts in: one still streaming when the lifetime changes wrote by the old one
+    const startConv = conv
+    const startGen = conv.ttlGen
     const r = yield* next(e)
     if (r.usage) {
       const prev = conv.samples[conv.samples.length - 1]
-      const cur: Sample = {
+      const cur: Request = {
+        // a request that started in another conversation (/clear mid-stream) is no one's evidence
+        ttlGen: conv === startConv ? startGen : -1,
         turnId: e.turnId,
         index: e.index,
         model: r.usage.model || e.model,
@@ -672,8 +680,8 @@ export const register: Register = (on, options) => {
       // the account as last read; the re-read below reads it again and recomputes
       recomputeTtl()
       // a lifetime pinned by the option, the environment or the setting is what Claude Code asks for: no guessing over it.
-      // Over the account's default, only a request after the one that last wrote under an older lifetime is evidence
-      if (inferable && !(prev && prev.startedAt <= conv.ttlChangedAfter)) {
+      // Over the account's default, only two requests that both started under the lifetime in force now are evidence
+      if (inferable && prev?.ttlGen === conv.ttlGen && cur.ttlGen === conv.ttlGen) {
         const seen = observeTtl(prev, cur, conv.observed)
         if (seen !== conv.observed) {
           conv.observed = seen
