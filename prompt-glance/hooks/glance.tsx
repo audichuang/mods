@@ -138,6 +138,9 @@ type Conversation = {
   ttl: Ttl
   ttlSource: string
   observed: Ttl | undefined
+  // when the lifetime Claude Code asks for last changed: the start of the latest request before it. An entry that
+  // request (or an earlier one) wrote lives by the old lifetime, so a hit on it says nothing about the new one
+  ttlChangedAfter: number
   // what the clock last drew, so it redraws only on a change
   lastKey: string
   // the countdown toasts: the request whose cache entry they count down, and the mark last fired
@@ -157,6 +160,7 @@ const startConversation = (): Conversation => ({
   ttl: baseTtl,
   ttlSource: envSource,
   observed: undefined,
+  ttlChangedAfter: -Infinity,
   lastKey: '',
   toast: { startedAt: 0, level: Infinity },
   tally: new Map(),
@@ -227,7 +231,10 @@ function readGitStatus($: EngineInterface, force: boolean) {
  */
 function recomputeTtl() {
   const choice = decideTtl(ttlOption, env, setting, account)
-  if (choice.ttl !== baseTtl || choice.source !== envSource) conv.observed = undefined
+  if (choice.ttl !== baseTtl || choice.source !== envSource) {
+    conv.observed = undefined
+    conv.ttlChangedAfter = conv.samples[conv.samples.length - 1]?.startedAt ?? -Infinity
+  }
   baseTtl = choice.ttl
   envSource = choice.source
   inferable = isAccountDefault(choice)
@@ -664,8 +671,9 @@ export const register: Register = (on, options) => {
       if (!conv.turnNo.has(e.turnId)) conv.turnNo.set(e.turnId, conv.turnNo.size + 1)
       // the account as last read; the re-read below reads it again and recomputes
       recomputeTtl()
-      // a lifetime pinned by the option, the environment or the setting is what Claude Code asks for: no guessing over it
-      if (inferable) {
+      // a lifetime pinned by the option, the environment or the setting is what Claude Code asks for: no guessing over it.
+      // Over the account's default, only a request after the one that last wrote under an older lifetime is evidence
+      if (inferable && !(prev && prev.startedAt <= conv.ttlChangedAfter)) {
         const seen = observeTtl(prev, cur, conv.observed)
         if (seen !== conv.observed) {
           conv.observed = seen

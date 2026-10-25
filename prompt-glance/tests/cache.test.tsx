@@ -1019,6 +1019,33 @@ describe('the clock', () => {
     expect(calls.toasts).toEqual([expect.stringMatching(/^cache expires in [45]:\d\d: send a message to keep 81\.3k tokens warm$/)])
   })
 
+  test('after the switch to usage credits, a hit on the entry the subscription wrote proves no hour', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() - 40 * 60_000 })
+    const limits = [{ kind: 'five_hour', percentUsed: 40 }]
+    fakeEngine(on, {}, calls, undefined, limits, undefined, { clock: false })
+    on('command.run', () => ({ text: '' }) as never)
+    await $.session.start(START)
+    await clock.advance(1000)
+    await step($)
+    await clock.set(Date.now() - 20 * 60_000)
+    // a hit 20 minutes on: the hour shows
+    await step($, { turnId: 't2' })
+    limits[0] = { kind: 'five_hour', percentUsed: 100 }
+    await clock.advance(10_000)
+    const switched = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((switched as { text: string }).text).toMatch(/^5m cache \(usage credits default\)/)
+    await $.command.run({ command: 'cache', args: 'stop' } as never)
+    // 20 minutes later a hit, but on the entry the last subscription request wrote with its hour: no proof for credits
+    await clock.set(Date.now())
+    await step($, { turnId: 't3' })
+    await clock.advance(1000)
+    const ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^5m $/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^1h $/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
   for (const [name, env, setting] of [
     ['CLAUDE_CODE_PROMPT_CACHE_TTL', { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }, undefined],
     ['FORCE_PROMPT_CACHING_5M', { FORCE_PROMPT_CACHING_5M: '1' }, undefined],
