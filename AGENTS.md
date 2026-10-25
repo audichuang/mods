@@ -19,6 +19,7 @@
 - 新增 mod：資料夾裡有 `.claude-plugin/plugin.json` 就會被 check.sh 撿到，`hooks/hooks.json` 有 `modules` 就當 mod 跑 test 和 tsc；`plugin.json` 要有 `author`，不然 `--strict` 不過。
 - 測試環境沒有 `setTimeout`。要測計時器的多個週期用 `claude-code/testing` 的 `mock.clock(on)` 再 `advance`；只測啟動時那次，就自己 `on('clock.every', …)` 回 `{ deny }`。
 - `gh-quota`：改 `gh-quota-guard.py` 前先在 `hooktest.sh` 加案例（可寫 `DENY:<理由片段>` 斷言理由）；改 `bin/gh-wait` 前先在 `gh-wait-test.sh` 加案例。
+- `gh-quota-guard.py` 是擋 agent 順手寫出的輪詢，不是安全邊界：審查找到刻意構造的繞過（多層 `bash -c`、跳脫空格、單引號裡的字面 `$i`）歸 Noted，不再加解析層；用 regex 解析 shell 每補一處就多一處邊界，批次判斷別退回「認出重導向再刪掉」的做法。
 - 實際互動 session 驗 mod：這台沒有 tmux，用 `(sleep 60 | script -q /dev/null claude >out 2>&1 &)`，在**已信任**的資料夾開（`~/mods` 尚未信任會卡在信任提示），看 log 或去掉 ANSI 後 grep 輸出。這只證明文字有畫出來，看不出位置；改版面要請使用者截圖確認。
 
 ## 發版與部署
