@@ -17,12 +17,17 @@ export function isEnglish(text: string): boolean | undefined {
   return cjk / (latin / 4 + cjk) <= 0.3
 }
 
-// The person's own words: typed, through Remote Control or the SDK host, or
-// a plugin's submission asUser. Notifications, peers and continuations are not.
+// The person's own words: typed, through Remote Control, the SDK host, a Slack
+// ping, a same-user channel the engine can't classify, or a plugin's submission
+// asUser. Notifications, peers and continuations are not.
 function typedByUser(e: PromptSubmitInput): boolean {
   if (e.isMeta) return false
   const o = e.origin
-  return o.kind === 'composer' || o.kind === 'bridge' || o.kind === 'sdk' || (o.kind === 'plugin' && o.asUser === true)
+  return (
+    o.kind === 'composer' || o.kind === 'bridge' || o.kind === 'sdk' ||
+    o.kind === 'slack-ping' || o.kind === 'unclassified' ||
+    (o.kind === 'plugin' && o.asUser === true)
+  )
 }
 
 export const register: Register = on => {

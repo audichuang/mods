@@ -1,1 +1,1 @@
-{"name": "zh-steady", "version": "0.2.0", "description": "Nudges the model back to Traditional Chinese right after a step drifts into English, before it snowballs.", "author": {"name": "audichuang", "url": "https://github.com/audichuang"}}
+{"name": "zh-steady", "version": "0.2.1", "description": "Nudges the model back to Traditional Chinese right after a step drifts into English, before it snowballs.", "author": {"name": "audichuang", "url": "https://github.com/audichuang"}}

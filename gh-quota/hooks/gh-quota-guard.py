@@ -49,6 +49,10 @@ QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
 # (and auth: `gh auth token` / `gh auth status` are cheap and sit next to real calls).
 GH_CALL = re.compile(POS + r'(?P<gh>' + GH + r')' + REPO
                      + r'\s+(?!(?:auth|config|alias|completion|help|version)\b)[a-z]')
+# Loop variables: `for r in …` and the names `while read [-r] r …` assigns.
+FOR_VAR = re.compile(r'for\s+([A-Za-z_]\w*)\s+in\b')
+READ_ARGS = re.compile(r'\bread\b([^;\n]*?)(?:;|\n|\bdo\b)')
+READ_VAR = re.compile(r'(?<![-\w])([A-Za-z_]\w*)\b')
 SLEEP = re.compile(r'\bsleep\s+([^\s;&|)]+)')
 LITERAL = re.compile(r'(\d+(?:\.\d+)?)([smhd]?)')
 UNIT = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
@@ -198,6 +202,34 @@ def loops(cmd):
         yield kind, start, len(cmd)
 
 
+def batch(cmd, mask, kind, start, end):
+    """True when a `for` / `while read` loop feeds its variable to every gh call in it
+    (gh repo clone me/$r): one call per item is a batch however short its sleep. A gh call
+    that ignores the loop variable (for i in $(seq 30); do gh run view 1 …) is polling."""
+    if kind == 'for':
+        m = FOR_VAR.match(cmd, start)
+        names = [m.group(1)] if m else []
+    else:
+        m = READ_ARGS.search(cmd, start, end)
+        names = READ_VAR.findall(m.group(1)) if m else []
+    if not names:
+        return False
+    # gh inside a payload (bash -c 'gh api user') can't be tied to the item: not a batch.
+    if any(gh_called(p, code_mask(p), 0, len(p), MAX_DEPTH) for p in payloads(cmd, mask, start, end)):
+        return False
+    uses = re.compile(r'\$\{?(?:' + '|'.join(names) + r')\b')
+    calls = [m for m in GH_CALL.finditer(cmd, start, end) if mask[m.start('gh')] != QUOTE]
+    for m in calls:
+        # The request itself: its wrapper (ssh $h) through the first separator or redirection
+        # outside quotes (--jq '.[] | .n' is one argument; > "out-$i" names a file and the
+        # request is the same every time, so whatever follows it never counts).
+        stop = next((k for k in range(m.start('gh'), end)
+                     if cmd[k] in ';&|\n)<>' and mask[k] == CODE), end)
+        if not uses.search(cmd, m.start(), stop):
+            return False
+    return bool(calls)
+
+
 def reason(cmd, depth=0):
     if 'gh' not in cmd and 'github' not in cmd.lower():
         return None
@@ -213,6 +245,8 @@ def reason(cmd, depth=0):
     mask = code_mask(cmd)
     for kind, start, end in loops(cmd):
         if not gh_called(cmd, mask, start, end, depth):
+            continue
+        if kind in ('for', 'read') and batch(cmd, mask, kind, start, end):
             continue
         body = cmd[start:end]
         args = [a.strip('\'"') for a in SLEEP.findall(body)]

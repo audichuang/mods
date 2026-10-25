@@ -74,7 +74,7 @@ test('machine-delivered English prompts never count as the user choosing English
   await $.prompt.submit(typed('幫我修這個 bug'))
   const origins = [
     { kind: 'peer' }, { kind: 'peer-send-message' }, { kind: 'scheduled-trigger' }, { kind: 'auto-continuation' },
-    { kind: 'unclassified' }, { kind: 'coordinator' }, { kind: 'channel', server: 's' }, { kind: 'plugin', name: 'p' },
+    { kind: 'coordinator' }, { kind: 'channel', server: 's' }, { kind: 'plugin', name: 'p' },
   ] as const
   for (const origin of origins) {
     await $.prompt.submit({ text: EN_PROMPT, wait: false, origin })
@@ -99,11 +99,14 @@ test('a notification between the English step and the tool call keeps the pendin
   expect((await bash($)).context).toEqual([REMINDER])
 })
 
-test('the person\'s English through bridge, sdk or a plugin asUser counts', async ($, on) => {
+test('the person\'s English through bridge, sdk, Slack, an unclassified channel or a plugin asUser counts', async ($, on) => {
   setup(on, EN)
-  const origins = [{ kind: 'bridge' }, { kind: 'sdk' }, { kind: 'plugin', name: 'p', asUser: true }] as const
+  const origins = [
+    { kind: 'bridge' }, { kind: 'sdk' }, { kind: 'slack-ping' }, { kind: 'unclassified' }, { kind: 'plugin', name: 'p', asUser: true },
+  ] as const
   for (const origin of origins) {
-    await $.prompt.submit(typed('幫我修這個 bug'))
+    // Long enough to judge, so each round starts from Chinese again.
+    await $.prompt.submit(typed(ZH))
     await $.prompt.submit({ text: EN_PROMPT, wait: false, origin })
     await step($)
     expect((await bash($)).context).toBeUndefined()
