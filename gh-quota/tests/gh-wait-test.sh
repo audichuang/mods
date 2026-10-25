@@ -63,7 +63,7 @@ RUN_WAIT='{"status":"in_progress","conclusion":null}'
 RUN_OK='{"status":"completed","conclusion":"success"}'
 RUNS_OK='{"check_runs":[{"name":"lint","status":"completed","conclusion":"success"}]}'
 SUITES_RUNNING='{"check_suites":[{"app":{"name":"GitHub Actions"},"status":"in_progress","latest_check_runs_count":1}]}'
-SUITES_DONE='{"check_suites":[{"app":{"name":"GitHub Actions"},"status":"completed","latest_check_runs_count":2}]}'
+SUITES_DONE='{"check_suites":[{"app":{"name":"GitHub Actions"},"status":"completed","conclusion":"success","latest_check_runs_count":2}]}'
 
 fresh
 resp 1 '200 OK' "$RUN_WAIT" 'Etag: W/"abc"'
@@ -118,7 +118,7 @@ check "pr: downgrade to wait clears the ETag" 0 'stdout-has=wait:1 workflow stil
 fresh
 echo abc123 > "$S/1.out"
 resp 2 '200 OK' "$RUNS_OK"
-resp 3 '200 OK' '{"check_suites":[{"app":{"name":"Some App"},"status":"queued","latest_check_runs_count":0},{"app":{"name":"GitHub Actions"},"status":"completed","latest_check_runs_count":1}]}'
+resp 3 '200 OK' '{"check_suites":[{"app":{"name":"Some App"},"status":"queued","latest_check_runs_count":0},{"app":{"name":"GitHub Actions"},"status":"completed","conclusion":"success","latest_check_runs_count":1}]}'
 gw 20 pr 5 -R o/r -i 1
 check "pr: queued suite with no runs is ignored" 0 stdout-has=ok stdout-lacks=wait calls=3
 
@@ -138,6 +138,27 @@ resp 2 '200 OK' "$RUNS_OK"
 printf 'To get started with GitHub CLI, please run:  gh auth login\n' > "$S/3.err"; echo 4 > "$S/3.rc"
 gw 20 pr 5 -R o/r -i 1
 check "pr: check-suites not logged in stops" 2 'stderr-has=gh auth login' calls=3
+
+# A downstream job can appear and fail between the check-runs read and the suites read: the suite
+# is completed but failed, and the green runs snapshot is stale. Re-read the runs, never report ok.
+fresh
+echo abc123 > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' '{"check_suites":[{"app":{"name":"GitHub Actions"},"status":"completed","conclusion":"failure","latest_check_runs_count":2}]}'
+resp 4 '200 OK' '{"check_runs":[{"name":"lint","status":"completed","conclusion":"success"},{"name":"e2e","status":"completed","conclusion":"failure"}]}'
+gw 20 pr 5 -R o/r -i 1
+check "pr: a suite that failed after a green runs read is not ok" 1 'stdout-has=fail:e2e' calls=4
+
+# check-suites failing over and over must hit the same 5-error limit as the main request.
+fresh
+echo abc123 > "$S/1.out"
+for n in 2 4 6 8 10; do
+    resp $n '200 OK' "$RUNS_OK"
+    resp $((n + 1)) '503 Service Unavailable' '{"message":"Unavailable"}'
+    echo 'gh: Unavailable (HTTP 503)' > "$S/$((n + 1)).err"; echo 1 > "$S/$((n + 1)).rc"
+done
+gw 30 pr 5 -R o/r -i 1
+check "pr: check-suites failing 5 times in a row gives up" 2 'stderr-has=HTTP 503' calls=11
 
 fresh
 echo abc123 > "$S/1.out"
