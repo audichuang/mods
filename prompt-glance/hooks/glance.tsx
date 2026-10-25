@@ -20,8 +20,10 @@
  * CLAUDE_CODE_PROMPT_CACHE_TTL, the promptCacheTtl setting, ENABLE_PROMPT_CACHING_1H,
  * then the account (1 hour on a Claude subscription, 5 minutes otherwise). The
  * API names the TTL of a write but the mod API passes on only the token counts,
- * so the mod also watches the gaps between requests (a hit after more than 5
- * minutes proves 1 hour; see observeTtl). `ttl: "5m" | "1h"` pins it.
+ * so while the lifetime is the account's default the mod also watches the gaps
+ * between requests (a hit after more than 5 minutes proves 1 hour; see
+ * observeTtl), and drops what it saw when that default changes. `ttl: "5m" | "1h"`,
+ * the environment variables and the setting pin it.
  *
  * Needs Claude Code >= 2.1.287.
  *
@@ -50,6 +52,7 @@ import {
   emptyTotals,
   totalsHit,
   decideTtl,
+  isAccountDefault,
   observeTtl,
   lifeColor,
   lifeRatio,
@@ -73,7 +76,8 @@ const TOAST_MIN_TOKENS = 20_000
 // the lifetime Claude Code asks for, and why, before any request timing says otherwise
 let baseTtl: Ttl = '5m'
 let envSource = 'default'
-let pinned = false
+// whether that came from the account's default, the only lifetime request timing may overrule
+let inferable = true
 // the ttl option, as the config menu set it
 let ttlOption: unknown
 let setting: Ttl | undefined
@@ -217,11 +221,16 @@ function readGitStatus($: EngineInterface, force: boolean) {
     })
 }
 
-/** Which lifetime Claude Code asks for now, from the option, the environment, the setting and the account. */
+/**
+ * Which lifetime Claude Code asks for now, from the option, the environment, the setting and the account.
+ * A change of it (a subscription out of plan usage moving to usage credits) outdates what the traffic showed.
+ */
 function recomputeTtl() {
   const choice = decideTtl(ttlOption, env, setting, account)
+  if (choice.ttl !== baseTtl || choice.source !== envSource) conv.observed = undefined
   baseTtl = choice.ttl
   envSource = choice.source
+  inferable = isAccountDefault(choice)
   if (conv.observed === undefined) {
     conv.ttl = baseTtl
     conv.ttlSource = envSource
@@ -537,7 +546,6 @@ export const register: Register = (on, options) => {
       disableSonnet: await $.env.get('DISABLE_PROMPT_CACHING_SONNET').catch(none),
       disableOpus: await $.env.get('DISABLE_PROMPT_CACHING_OPUS').catch(none),
     }
-    pinned = options.ttl === '5m' || options.ttl === '1h'
     setting = await readSetting($)
     recomputeTtl()
 
@@ -650,9 +658,10 @@ export const register: Register = (on, options) => {
       conv.samples.push(cur)
       if (conv.samples.length > KEEP) conv.samples = conv.samples.slice(-KEEP)
       if (!conv.turnNo.has(e.turnId)) conv.turnNo.set(e.turnId, conv.turnNo.size + 1)
-      if (!pinned) {
-        // the account as last read; the re-read below reads it again and recomputes
-        recomputeTtl()
+      // the account as last read; the re-read below reads it again and recomputes
+      recomputeTtl()
+      // a lifetime pinned by the option, the environment or the setting is what Claude Code asks for: no guessing over it
+      if (inferable) {
         const seen = observeTtl(prev, cur, conv.observed)
         if (seen !== conv.observed) {
           conv.observed = seen

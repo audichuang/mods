@@ -6,6 +6,7 @@ import {
   segments,
   observeTtl,
   decideTtl,
+  isAccountDefault,
   accountOf,
   nextToastMark,
   bar,
@@ -596,6 +597,16 @@ describe('which lifetime Claude Code asks for', () => {
     expect(decideTtl('auto', {}, undefined, 'other').ttl).toBe('5m')
     expect(decideTtl('1h', { force5m: '1' }, '5m', 'other').ttl).toBe('1h')
   })
+  test('only an account default may be overruled by request timing', () => {
+    expect(isAccountDefault(decideTtl('auto', {}, undefined, 'subscription'))).toBe(true)
+    expect(isAccountDefault(decideTtl('auto', {}, undefined, 'credits'))).toBe(true)
+    expect(isAccountDefault(decideTtl('auto', {}, undefined, 'other'))).toBe(true)
+    expect(isAccountDefault(decideTtl('5m', {}, undefined, 'subscription'))).toBe(false)
+    expect(isAccountDefault(decideTtl('auto', { force5m: '1' }, undefined, 'subscription'))).toBe(false)
+    expect(isAccountDefault(decideTtl('auto', { ttlVar: '5m' }, undefined, 'subscription'))).toBe(false)
+    expect(isAccountDefault(decideTtl('auto', {}, '5m', 'subscription'))).toBe(false)
+    expect(isAccountDefault(decideTtl('auto', { enable1h: '1' }, undefined, 'other'))).toBe(false)
+  })
   test('the account comes from the plan windows the last response reported', () => {
     expect(accountOf([])).toBe('other')
     expect(accountOf([{ kind: 'spend_limit', percentUsed: 10 }])).toBe('other')
@@ -978,6 +989,69 @@ describe('the clock', () => {
     await step($, { turnId: 't2' })
     const reply = await $.command.run({ command: 'cache', args: '' } as never)
     expect((reply as { text: string }).text).toMatch(/^1h cache \(observed from request timing; default said 5m\)/)
+  })
+
+  test('a subscription that runs out of plan usage counts down 5 minutes again, over the hour its traffic showed', { options: { warnSeconds: 300 } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [], toasts: [] }
+    // the first request 20 minutes ago, by the clock requests are timed by
+    const clock = mock.clock(on, { now: Date.now() - 20 * 60_000 })
+    const limits = [{ kind: 'five_hour', percentUsed: 40 }]
+    fakeEngine(on, {}, calls, undefined, limits, undefined, { clock: false })
+    await $.session.start(START)
+    await clock.advance(1000)
+    await step($)
+    await clock.set(Date.now())
+    // a hit 20 minutes on: the traffic shows the hour
+    await step($, { turnId: 't2' })
+    await clock.advance(1000)
+    let ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^1h $/ })).toBeDefined()
+    await ui.unmount()
+    expect(calls.toasts).toEqual([])
+
+    // the 5-hour window fills: requests now draw on usage credits, whose cache lives 5 minutes
+    limits[0] = { kind: 'five_hour', percentUsed: 100 }
+    await clock.advance(10_000)
+    ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^5m $/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^1h $/ })).toBeUndefined()
+    await ui.unmount()
+    expect(calls.toasts).toEqual([expect.stringMatching(/^cache expires in [45]:\d\d: send a message to keep 81\.3k tokens warm$/)])
+  })
+
+  for (const [name, env, setting] of [
+    ['CLAUDE_CODE_PROMPT_CACHE_TTL', { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }, undefined],
+    ['FORCE_PROMPT_CACHING_5M', { FORCE_PROMPT_CACHING_5M: '1' }, undefined],
+    ['the promptCacheTtl setting', {}, '5m'],
+  ] as const) {
+    test(`5m pinned by ${name} stays 5m whatever the traffic shows`, async ($, on) => {
+      const calls: Calls = { status: [], logs: [] }
+      let at = Date.now() - 20 * 60_000
+      on('clock.now', () => ({ value: at }) as never)
+      fakeEngine(on, env, calls)
+      if (setting) on('settings.read', () => ({ value: { promptCacheTtl: setting } }) as never)
+      on('command.run', () => ({ text: '' }) as never)
+      await $.session.start(START)
+      await step($)
+      at = Date.now()
+      await step($, { turnId: 't2' })
+      const reply = await $.command.run({ command: 'cache', args: '' } as never)
+      expect((reply as { text: string }).text).toMatch(new RegExp(`^5m cache \\(${name}\\)`))
+    })
+  }
+
+  test('5m pinned by the ttl option stays 5m whatever the traffic shows', { options: { ttl: '5m' } }, async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    let at = Date.now() - 20 * 60_000
+    on('clock.now', () => ({ value: at }) as never)
+    fakeEngine(on, {}, calls)
+    on('command.run', () => ({ text: '' }) as never)
+    await $.session.start(START)
+    await step($)
+    at = Date.now()
+    await step($, { turnId: 't2' })
+    const reply = await $.command.run({ command: 'cache', args: '' } as never)
+    expect((reply as { text: string }).text).toMatch(/^5m cache \(the ttl option\)/)
   })
 })
 

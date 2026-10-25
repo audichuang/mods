@@ -93,6 +93,16 @@ export function decideTtl(option: unknown, env: CacheEnv, setting?: unknown, acc
   return { ttl: '5m', source: 'default' }
 }
 
+// the sources decideTtl names when nothing pinned the lifetime: the account's own default
+const ACCOUNT_DEFAULTS: readonly string[] = ['Claude subscription default', 'usage credits default', 'default']
+
+/**
+ * Whether the lifetime came from the account's default rather than from the
+ * ttl option, an environment variable or the promptCacheTtl setting: only then
+ * may the requests' timing say otherwise (see observeTtl).
+ */
+export const isAccountDefault = (choice: TtlChoice) => ACCOUNT_DEFAULTS.includes(choice.source)
+
 export const resolveTtl = (option: unknown, env: CacheEnv, setting?: unknown, account?: Account): Ttl =>
   decideTtl(option, env, setting, account).ttl
 
@@ -295,11 +305,14 @@ const SLACK_MS = 10_000
 
 /**
  * What the traffic says about the cache lifetime, given the request before and
- * `known`, what earlier requests already showed.
+ * `known`, what earlier requests already showed. Asked only while the lifetime
+ * is the account's default (isAccountDefault), and what it said is dropped when
+ * that default changes (a subscription running out of plan usage moves to usage
+ * credits and their 5 minutes).
  *
  *   - a hit (the cache served at least half of the previous prompt) more than
  *     5 minutes after the previous request began proves the 1-hour lifetime,
- *     and nothing later undoes it: a miss afterwards is more likely a changed
+ *     and no later request undoes it: a miss afterwards is more likely a changed
  *     prefix than a lapse
  *   - a miss with the same model and a prompt that did not shrink, 5 minutes to
  *     an hour after the previous request, says the entry lapsed: 5 minutes
