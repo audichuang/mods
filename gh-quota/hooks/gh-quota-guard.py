@@ -53,7 +53,6 @@ GH_CALL = re.compile(POS + r'(?P<gh>' + GH + r')' + REPO
 FOR_VAR = re.compile(r'for\s+([A-Za-z_]\w*)\s+in\b')
 READ_ARGS = re.compile(r'\bread\b([^;\n]*?)(?:;|\n|\bdo\b)')
 READ_VAR = re.compile(r'(?<![-\w])([A-Za-z_]\w*)\b')
-REDIRECT = re.compile(r'\d*(?:>>?|<)&?\s*' + WORD)
 SLEEP = re.compile(r'\bsleep\s+([^\s;&|)]+)')
 LITERAL = re.compile(r'(\d+(?:\.\d+)?)([smhd]?)')
 UNIT = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
@@ -221,15 +220,12 @@ def batch(cmd, mask, kind, start, end):
     uses = re.compile(r'\$\{?(?:' + '|'.join(names) + r')\b')
     calls = [m for m in GH_CALL.finditer(cmd, start, end) if mask[m.start('gh')] != QUOTE]
     for m in calls:
-        # The request itself: its wrapper (ssh $h) through the end of the gh invocation, the
-        # end found outside quotes (--jq '.[] | .n' is one argument), redirections dropped
-        # (> "out-$i" names a file, the request is the same every time).
+        # The request itself: its wrapper (ssh $h) through the first separator or redirection
+        # outside quotes (--jq '.[] | .n' is one argument; > "out-$i" names a file and the
+        # request is the same every time, so whatever follows it never counts).
         stop = next((k for k in range(m.start('gh'), end)
-                     if cmd[k] in ';&|\n)' and mask[k] == CODE), end)
-        base = m.start()
-        request = REDIRECT.sub(lambda r: ' ' if mask[base + r.start()] == CODE else r.group(0),
-                               cmd[base:stop])
-        if not uses.search(request):
+                     if cmd[k] in ';&|\n)<>' and mask[k] == CODE), end)
+        if not uses.search(cmd, m.start(), stop):
             return False
     return bool(calls)
 
