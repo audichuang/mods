@@ -1120,6 +1120,20 @@ describe('/cache', () => {
 })
 
 describe('the band gives way', () => {
+  test('to the /cache pane a hot reload left open', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, {}, calls)
+    engineDraws(on)
+    // /reload-plugins: the module starts over, the engine still has the pane up, and session.start runs again
+    on('ui.panes', () => ({ value: [{ id: 'cache', title: 'cache', isShown: true, isFocused: false, isPlaced: true }] }) as never)
+    await $.session.start(START)
+    await step($)
+    const ui = await wide($)
+    expect(await ui.find({ type: 'Text', text: /^engine$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Opus 5\.5$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
   test('to a survey', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, {}, calls)

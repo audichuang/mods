@@ -536,6 +536,10 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
     newConversation()
+    // a hot reload (/reload-plugins, a config change) starts the module over with the /cache pane still up:
+    // the engine's record says whether it is, so the band keeps giving way to it
+    const panes = await $.ui.panes().catch(() => undefined)
+    if (panes) isPaneOpen = panes.some(p => p.id === PANE)
     const none = () => undefined
     env = {
       enable1h: await $.env.get('ENABLE_PROMPT_CACHING_1H').catch(none),
