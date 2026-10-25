@@ -226,7 +226,9 @@ def batch(cmd, mask, kind, start, end):
         # (> "out-$i" names a file, the request is the same every time).
         stop = next((k for k in range(m.start('gh'), end)
                      if cmd[k] in ';&|\n)' and mask[k] == CODE), end)
-        request = REDIRECT.sub(' ', cmd[m.start():stop])
+        base = m.start()
+        request = REDIRECT.sub(lambda r: ' ' if mask[base + r.start()] == CODE else r.group(0),
+                               cmd[base:stop])
         if not uses.search(request):
             return False
     return bool(calls)

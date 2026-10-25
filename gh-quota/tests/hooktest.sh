@@ -178,6 +178,7 @@ DENY|for i in $(seq 99); do gh api user >> log-$i; sleep 1; done
 DENY|for i in $(seq 99); do echo "$i $(gh api user)"; sleep 1; done
 DENY|for r in a b c; do gh api repos/me/$r; bash -c 'gh api user'; sleep 1; done
 allow|for r in me/a me/b; do gh pr list --json number --jq '.[] | .number' -R "$r"; sleep 1; done
+allow|for r in 10 100 1000; do gh api --method GET search/repositories -f q="stars:>$r"; sleep 1; done
 allow|for r in me/a me/b; do gh api "repos/$r/pulls" --jq '.[] | select(.draft); .number' > "pr-$r.txt"; sleep 1; done
 DENY:沒有 sleep|while true; do read x; gh api "$x"; done
 DENY|while true; do echo "$(gh run view 1 --json status)"; sleep 5; done
