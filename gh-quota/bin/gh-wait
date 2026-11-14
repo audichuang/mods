@@ -11,7 +11,8 @@
 # (a job with needs: gets its check run only after the jobs it needs finish).
 # Right after a push the PR can still report its old head, whose checks already finished.
 # --sha waits until the PR head is that commit first; without it, a checkout on the PR's
-# branch whose HEAD is pushed (HEAD = @{push} or @{upstream}) waits for HEAD the same way.
+# branch, pushed to the PR's head repo, whose HEAD is pushed (HEAD = @{push} or @{upstream})
+# waits for HEAD the same way.
 # commit waits the same way for one commit's checks (a push with no PR, such as to main),
 # including while its workflows have not started yet.
 #
@@ -34,6 +35,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [[ $interval =~ ^[1-9][0-9]*$ && $timeout =~ ^[1-9][0-9]*$ ]] || usage
+[ -z "$want" ] || [ "$kind" = pr ] || usage
 command -v jq >/dev/null || { echo 'gh-wait: jq is required (brew install jq / apt install jq)' >&2; exit 2; }
 [ -n "$repo" ] || repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
 
@@ -60,25 +62,43 @@ rate_wait() {
     echo "$(date +%H:%M:%S) rate limit used up, waiting ${pause}s for the reset" >&2
     sleep $pause
 }
-# head_read: sets $sha and $ref to the PR's head.
+# head_read: sets $sha, $ref and $head_repo (owner/name, empty for a deleted fork) to the PR's
+# head. Errors are handled like the main loop's: wait out the quota, retry 5 times, stop on 4xx.
 head_read() {
+    local tries=0 rc err
     while :; do
         resp=$(gh api -i "repos/$repo/pulls/$target" 2>"$errf")
+        rc=$?
         code=$(head -1 <<<"$resp" | awk '{print $2}' | tr -d '\r')
+        err=$(head -3 "$errf" | tr '\r\n' '  ' | sed 's/ *$//')
         if [ "$code" = 200 ]; then
-            read -r sha ref < <(awk 'f; /^\r?$/ {f=1}' <<<"$resp" | jq -r '.head.sha + " " + .head.ref')
+            read -r sha ref head_repo < <(awk 'f; /^\r?$/ {f=1}' <<<"$resp" \
+                | jq -r '"\(.head.sha // "") \(.head.ref // "") \(.head.repo.full_name // "")"' 2>/dev/null)
             [ -n "$sha" ] && return
+            echo "$(date +%H:%M:%S) reading PR $target: the reply has no head commit" >&2
             exit 2
         fi
         rate_wait && continue
-        echo "$(date +%H:%M:%S) ${code:+HTTP $code }reading PR $target: $(head -3 "$errf" | tr '\r\n' '  ')" >&2
-        exit 2
+        if [[ $code =~ ^(401|404|422)$ ]] || { [ -z "$code" ] && { [ $rc -eq 4 ] || grep -qiE 'gh auth login|not logged in' "$errf"; }; }; then
+            echo "$(date +%H:%M:%S) ${code:+HTTP $code }reading PR $target: ${err:-gh exited $rc}" >&2
+            exit 2
+        fi
+        tries=$((tries + 1))
+        echo "$(date +%H:%M:%S) reading PR $target: ${code:+HTTP $code: }${err:-gh exited $rc} (attempt $tries)" >&2
+        [ $tries -ge 5 ] && exit 2
+        sleep $((interval * tries))
     done
 }
-# pushed_head <branch>: HEAD when the current checkout is on <branch> and HEAD is pushed.
+# pushed_head <branch> <owner/name>: HEAD when the current checkout is on <branch>, pushes it to
+# <owner/name> on GitHub, and HEAD is pushed. A same-named branch elsewhere (a fork PR from main)
+# is someone else's commit.
 pushed_head() {
-    local head up
-    [ -n "$1" ] && [ "$(git symbolic-ref -q --short HEAD 2>/dev/null)" = "$1" ] || return 0
+    local head up remote url
+    [ -n "$1" ] && [ -n "$2" ] && [ "$(git symbolic-ref -q --short HEAD 2>/dev/null)" = "$1" ] || return 0
+    remote=$(git config "branch.$1.pushRemote" || git config remote.pushDefault || git config "branch.$1.remote") || return 0
+    url=$(git remote get-url "$remote" 2>/dev/null) || return 0
+    url=$(tr '[:upper:]' '[:lower:]' <<<"${url%.git}") || return 0
+    [[ $url == *[/:]$(tr '[:upper:]' '[:lower:]' <<<"$2") ]] || return 0
     head=$(git rev-parse -q --verify HEAD 2>/dev/null) || return 0
     up=$(git rev-parse -q --verify '@{push}' 2>/dev/null || git rev-parse -q --verify '@{upstream}' 2>/dev/null) || return 0
     [ "$head" = "$up" ] && echo "$head"
@@ -92,13 +112,23 @@ case $kind in
         ;;
     pr)
         head_read
-        [ -n "$want" ] || want=$(pushed_head "$ref")
+        # A guessed HEAD can be wrong (the PR already moved past it), so its wait is bounded;
+        # GitHub catches up with a push within seconds. An explicit --sha waits to the deadline.
+        catchup=$deadline
+        if [ -z "$want" ]; then
+            want=$(pushed_head "$ref" "$head_repo")
+            catchup=$((SECONDS + ${GH_WAIT_CATCHUP:-120}))
+        fi
         if [ -n "$want" ] && [[ $sha != "$want"* ]]; then
             echo "$(date +%H:%M:%S) wait:PR head is ${sha:0:7}, waiting for ${want:0:7}"
             while [[ $sha != "$want"* ]]; do
                 if [ $SECONDS -ge $deadline ]; then
                     echo "$(date +%H:%M:%S) timeout after ${timeout} min, PR head is ${sha:0:7}, never ${want:0:7}" >&2
                     exit 2
+                fi
+                if [ $SECONDS -ge $catchup ]; then
+                    echo "$(date +%H:%M:%S) PR head stayed ${sha:0:7}, not the local HEAD ${want:0:7}; waiting for ${sha:0:7}" >&2
+                    break
                 fi
                 sleep "$interval"
                 head_read

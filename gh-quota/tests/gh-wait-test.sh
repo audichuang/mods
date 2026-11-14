@@ -188,8 +188,8 @@ check "pr: rate limit on the head read waits for the reset" 0 'stderr-has=rate l
 
 # Right after a push GitHub can still report the old head: --sha waits for the PR to reach it.
 fresh
-resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\"}}"
-resp 2 '200 OK' "{\"head\":{\"sha\":\"abc123\",\"ref\":\"feat\"}}"
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
+resp 2 '200 OK' "{\"head\":{\"sha\":\"abc123\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
 resp 3 '200 OK' "$RUNS_OK"
 resp 4 '200 OK' "$SUITES_DONE"
 gw 20 pr 5 -R o/r -i 1 --sha abc123
@@ -197,27 +197,27 @@ check "pr --sha: waits for the PR head to reach the pushed commit" 0 'stdout-has
     argv-has=repos/o/r/commits/abc123/check-runs argv-lacks=commits/old111 calls=4
 
 fresh
-resp 1 '200 OK' "{\"head\":{\"sha\":\"abc123def\",\"ref\":\"feat\"}}"
+resp 1 '200 OK' "{\"head\":{\"sha\":\"abc123def\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
 resp 2 '200 OK' "$RUNS_OK"
 resp 3 '200 OK' "$SUITES_DONE"
 gw 20 pr 5 -R o/r -i 1 --sha abc123
 check "pr --sha: a short sha matches the head" 0 stdout-lacks=wait:PR calls=3
 
 fresh
-resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\"}}"
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
 gw 20 pr 5 -R o/r -i 1 -t 1 --sha abc123
 check "pr --sha: never reached times out" 2 'stderr-has=timeout' 'stderr-has=PR head is old111'
 
 # Without --sha, a checkout on the PR's branch whose HEAD is pushed waits for that HEAD.
 R=$T/repo
 git init -q -b feat "$R" && git -C "$R" -c user.name=t -c user.email=t@t commit -q --allow-empty -m one
-git -C "$R" remote add origin "$T/none.git"
+git -C "$R" remote add origin https://github.com/o/r.git
 git -C "$R" update-ref refs/remotes/origin/feat HEAD
 git -C "$R" config branch.feat.remote origin && git -C "$R" config branch.feat.merge refs/heads/feat
 HEAD_SHA=$(git -C "$R" rev-parse HEAD)
 fresh
-resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\"}}"
-resp 2 '200 OK' "{\"head\":{\"sha\":\"$HEAD_SHA\",\"ref\":\"feat\"}}"
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
+resp 2 '200 OK' "{\"head\":{\"sha\":\"$HEAD_SHA\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
 resp 3 '200 OK' "$RUNS_OK"
 resp 4 '200 OK' "$SUITES_DONE"
 cd "$R" || exit 1; gw 20 pr 5 -R o/r -i 1; cd - > /dev/null || exit 1
@@ -231,10 +231,45 @@ resp 3 '200 OK' "$SUITES_DONE"
 cd "$R" || exit 1; gw 20 pr 5 -R o/r -i 1; cd - > /dev/null || exit 1
 check "pr: another branch's PR keeps its own head" 0 stdout-lacks=wait:PR argv-has=commits/old111/check-runs calls=3
 
+# A network error while waiting for the head is retried like any other request.
+fresh
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
+echo 'error connecting to api.github.com' > "$S/2.err"; echo 1 > "$S/2.rc"
+resp 3 '200 OK' "{\"head\":{\"sha\":\"abc123\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
+resp 4 '200 OK' "$RUNS_OK"
+resp 5 '200 OK' "$SUITES_DONE"
+gw 20 pr 5 -R o/r -i 1 --sha abc123
+check "pr --sha: a network error on a head read is retried" 0 'stderr-has=error connecting' \
+    argv-has=commits/abc123/check-runs calls=5
+
+fresh
+resp 1 '200 OK' '{"head":null}'
+gw 10 pr 5 -R o/r -i 1
+check "pr: a reply without a head says so" 2 'stderr-has=reading PR 5' argv-lacks=commits/null calls=1
+
+# Same branch name in another repo (a fork PR from main, say): not this checkout's HEAD.
+fresh
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"x/other\"}}}"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+cd "$R" || exit 1; gw 20 pr 5 -R o/r -i 1; cd - > /dev/null || exit 1
+check "pr: a PR from another repo's same-named branch keeps its own head" 0 stdout-lacks=wait:PR \
+    argv-has=commits/old111/check-runs calls=3
+
+# The PR can already be past the local HEAD (Update branch, a bot, another machine): the
+# guess is wrong, so after a bounded wait it takes the PR's current head instead of timing out.
+fresh
+resp 1 '200 OK' "{\"head\":{\"sha\":\"newer99\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
+resp 9 '200 OK' "$RUNS_OK"
+resp 10 '200 OK' "$SUITES_DONE"
+cd "$R" || exit 1; GH_WAIT_CATCHUP=4 gw 30 pr 5 -R o/r -i 1; cd - > /dev/null || exit 1
+check "pr: a PR head past the local HEAD is taken after the catch-up wait" 0 'stdout-has=wait:PR head is newer9' \
+    'stderr-has=newer9' argv-has=commits/newer99/check-runs stdout-has=ok
+
 # An unpushed HEAD is not what GitHub will test.
 git -C "$R" -c user.name=t -c user.email=t@t commit -q --allow-empty -m two
 fresh
-resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\"}}"
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\",\"repo\":{\"full_name\":\"o/r\"}}}"
 resp 2 '200 OK' "$RUNS_OK"
 resp 3 '200 OK' "$SUITES_DONE"
 cd "$R" || exit 1; gw 20 pr 5 -R o/r -i 1; cd - > /dev/null || exit 1
@@ -295,4 +330,6 @@ gw 10 run 7 -R
 check "usage: -R without value" 2 stderr-has=gh-wait
 gw 10 job 7 -R o/r
 check "usage: unknown kind" 2 stderr-has=gh-wait
+gw 10 run 7 -R o/r --sha abc
+check "usage: --sha is only for pr" 2 stderr-has=gh-wait
 exit $fail

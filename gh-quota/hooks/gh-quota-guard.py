@@ -39,7 +39,7 @@ REPO = r'(?:\s+(?:-R\s*|--repo(?:\s+|=))[^\s;&|]+)*'
 WATCH = re.compile(POS + GH + REPO + r'\s+run' + REPO + r'\s+watch\b')
 CHECKS = re.compile(POS + GH + REPO + r'\s+pr' + REPO + r'\s+checks\b[^;&|\n]*--watch')
 # watch(1) re-runs its command forever, every 2 s by default.
-WATCH_CMD = re.compile(POS + r'watch\b[^;&|\n]*\bgh\s')
+WATCH_CMD = re.compile(POS + r'(?P<cmd>watch)\b[^;&|\n]*\bgh\s')
 # Loop keywords and `done` at command position; matched on a copy with quoted text blanked,
 # so `echo "done"` or `x-done` never closes a loop.
 LOOP_KW = re.compile(r'(?:^|[;&|(\n]|\bdo\b|\bthen\b|\belse\b)\s*(while|until|for|done)\b')
@@ -71,9 +71,21 @@ AUTH = re.compile(r'(?i)authorization:|\$\(gh auth token\)|\$\{?(?:GITHUB_TOKEN|
 PAYLOAD = re.compile(SEP + r'(?P<w>' + WRAP + r'(?:' + PATH_PREFIX + r'(?:ba|z|da|k)?sh(?:\s+-[\w-]+)*\s+|'
                      + SSH + r'\s+|eval\s+))(?P<q>\'[^\']*\'|"(?:\\.|[^"\\])*")')
 HEREDOC = re.compile(r'<<(-)?\s*([\'"]?)(\w+)\2')
-# A heredoc fed to a shell (bash <<EOF, ssh host <<EOF) runs as commands; fed to anything else
-# (cat > f, python3 -, git commit -F -) its body is text and never counts as a gh call.
-SHELL_HEAD = re.compile(r'(?:^|[\s(])(?:\S*/)?(?:(?:ba|z|da|k)?sh|ssh|eval|source)\b')
+# A heredoc fed to a shell (bash <<EOF, cat <<EOF | ssh host bash -s) runs as commands; fed to
+# anything else (cat > f, python3 -, git commit -F -) its body is text and never counts as a gh call.
+# Judged on the heredoc's line with quoted text blanked: any shell word there counts, whatever
+# precedes it (sudo -u x, timeout 600, then), so a guess errs toward checking the body. A shell
+# word must stand alone, so "ssh" inside a path (/tmp/ssh-notes) is not one.
+SHELL_WORD = re.compile(r'(?:^|\s)(?:\S*/)?(?:(?:ba|z|da|k)?sh|ssh|eval|source)(?=\s|$)')
+
+
+def feeds_shell(cmd, i):
+    """True when the heredoc operator at cmd[i] belongs to a line that runs a shell."""
+    line_start = cmd.rfind('\n', 0, i) + 1
+    line_end = cmd.find('\n', i)
+    line = cmd[line_start:len(cmd) if line_end < 0 else line_end]
+    line = QUOTED.sub(lambda m: ' ' * len(m.group(0)), line)
+    return bool(SHELL_WORD.search(line))
 CODE, QUOTE, HEREDOC_BODY = 0, 1, 2
 MAX_DEPTH = 3
 
@@ -132,9 +144,7 @@ def code_mask(cmd):
         elif c == '<' and cmd.startswith('<<', i):
             m = HEREDOC.match(cmd, i)
             if m:
-                # The command taking the heredoc: from the last separator up to `<<`.
-                head = cmd[max(cmd.rfind(sep, 0, i) for sep in '\n;&|(') + 1:i]
-                heredocs.append((m.group(3), bool(m.group(1)), bool(SHELL_HEAD.search(head))))
+                heredocs.append((m.group(3), bool(m.group(1)), feeds_shell(cmd, i)))
                 i = m.end()
             else:
                 i += 2
@@ -249,8 +259,10 @@ def reason(cmd, depth=0):
 
     # A match inside quoted text is a search pattern or a message (grep "x|gh run …");
     # a quoted command that does run (bash -c '…', ssh host '…') is judged as a payload below.
-    def runs(pattern):
-        return any(mask[m.end() - 1] == CODE for m in pattern.finditer(cmd))
+    # Judged at the command word: gh's subcommand for gh, and for watch(1) the word itself, since
+    # its quoted argument (watch "gh pr view 1") is the command it re-runs.
+    def runs(pattern, at=lambda m: m.end() - 1):
+        return any(mask[at(m)] == CODE for m in pattern.finditer(cmd))
 
     if runs(WATCH):
         return '`gh run watch` 每輪打 2 個請求加每個執行中 job 1 個，會吃光共用的 5000/hr GitHub 額度。'
@@ -259,7 +271,7 @@ def reason(cmd, depth=0):
     if any(not AUTH.search(m.group(0)) for m in ANON_CURL.finditer(cmd)):
         return ('沒帶 token 的 curl／wget 打 api.github.com，吃的是出口 IP 共用的每小時 60 次匿名額度；'
                 '改用 `gh api <path>`（走帳號的 5000 次）。')
-    if runs(WATCH_CMD):
+    if runs(WATCH_CMD, lambda m: m.start('cmd')):
         return '`watch … gh` 會每隔幾秒重跑 gh，會吃光共用的 5000/hr GitHub 額度。'
     for kind, start, end in loops(cmd):
         if not gh_called(cmd, mask, start, end, depth):

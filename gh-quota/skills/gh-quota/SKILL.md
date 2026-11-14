@@ -19,7 +19,7 @@ gh-wait commit <sha> -R owner/repo     # 等一個 commit 的所有 checks（沒
 
 - 一律放背景（`run_in_background`）。前景會被 Bash 工具的 10 分鐘上限砍掉，`timeout` 設再大也一樣；接 `| tail` 時 `$?` 是 tail 的，真正的結束碼要看 `${PIPESTATUS[0]}`。
 - 等通知就好：通知來之前不讀它的輸出檔、不 `pgrep`、不另外跑 `gh run view`／`gh pr checks`，那些都是在它旁邊再打一次 API。
-- push 完馬上等 PR：GitHub 可能還回報舊的 head commit，它的 checks 早就跑完了，會讀到舊結果。在 PR 分支的 checkout 裡跑、HEAD 也已經 push 時，`gh-wait pr` 會自己等 PR head 變成 HEAD；其他情況（例如不在那個 checkout 裡）帶 `--sha <剛推的 commit>`。不要用 `sleep` 墊時間。
+- push 完馬上等 PR：GitHub 可能還回報舊的 head commit，它的 checks 早就跑完了，會讀到舊結果。在 PR 分支的 checkout 裡跑，分支有 upstream 或 pushRemote 指向 PR 的 head repo（`git push -u` 過），且 HEAD 已經 push 時，`gh-wait pr` 會自己等 PR head 變成 HEAD，最多 2 分鐘，等不到（例如 PR 已被 Update branch 推得更新）就改看 PR 當下的 head，並在 stderr 註明。其他情況（不在那個 checkout、push 時沒加 `-u`）帶 `--sha <剛推的 commit>`，它會一直等到 PR head 變成那個 commit 或逾時。不要用 `sleep` 墊時間。
 
 - 結束碼：0 成功、1 失敗（`pr` 印出失敗的 check，`run` 印出失敗的 job）、2 參數錯誤、API 錯誤或逾時（stderr 會寫是哪一種，並附上 gh 自己的錯誤訊息）。
 - 選項：`-i` 輪詢秒數（預設 15）、`-t` 逾時分鐘（預設 120）、`--sha`（只有 `pr`：先等 PR head 變成這個 commit，可給短 sha）。

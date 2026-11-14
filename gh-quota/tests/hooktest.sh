@@ -112,6 +112,9 @@ allow|grep -n "^DENY|gh run watch" tests/hooktest.sh
 allow|rg 'x|gh pr checks 3 --watch' notes.md
 allow|rg -n "a; watch -n 5 gh pr view" notes.md
 allow|grep -c 'x;gh run watch 1' log.txt
+DENY|watch -n 10 "gh pr checks 1"
+DENY|watch 'gh run view 1'
+DENY|watch -n 5 "gh api repos/o/r/actions/runs/1 -q .status"
 allow|timeout 60 gh run view 1
 DENY|gh -R o/r run watch 1
 DENY|gh --repo o/r pr checks 5 --watch
@@ -207,6 +210,15 @@ run "tee heredoc writing a doc line with gh pr checks --watch" allow 10 cmd $'te
 # Fed to a shell (directly, over ssh, or with sudo), the body runs: still judged.
 run "ssh heredoc polling gh" DENY 10 cmd $'ssh ubuntu bash -s <<\'EOF\'\nwhile true; do gh api x; sleep 5; done\nEOF'
 run "sudo sh heredoc running the watch command" DENY 10 cmd $'sudo sh <<EOF\ngh run watch 1\nEOF'
+# A heredoc piped into a shell runs too; "ssh" or "bash" in a quoted title or a path does not.
+run "cat heredoc piped to bash polling gh" DENY 10 cmd $'cat <<\'EOF\' | bash\nwhile true; do gh run view 1; sleep 5; done\nEOF'
+run "cat heredoc piped to ssh bash -s" DENY 10 cmd $'cat <<\'EOF\' | ssh ubuntu bash -s\ngh run watch 1\nEOF'
+run "gh pr create body heredoc with bash in the title" allow 10 cmd $'gh pr create --title \'Fix bash quoting\' --body-file - <<\'EOF\'\nwhile true; do gh run view 1; sleep 5; done\nEOF'
+run "cat heredoc into a path containing ssh" allow 10 cmd $'cat > /tmp/ssh-notes <<\'EOF\'\nwhile true; do gh run view 1; sleep 5; done\nEOF'
+run "sudo -u user bash heredoc polling gh" DENY 10 cmd $'sudo -u deploy bash <<\'EOF\'\nwhile true; do gh api x; sleep 5; done\nEOF'
+run "timeout ssh bash -s heredoc" DENY 10 cmd $'timeout 600 ssh ubuntu bash -s <<\'EOF\'\ngh run watch 1\nEOF'
+run "then bash heredoc polling gh" DENY 10 cmd $'if true; then bash <<\'EOF\'\nwhile true; do gh api x; sleep 5; done\nEOF'
+run "nice -n bash heredoc polling gh" DENY 10 cmd $'nice -n 10 bash <<\'EOF\'\nwhile true; do gh api x; sleep 5; done\nEOF'
 # A here-string (<<<) is not a heredoc: the lines after it are still commands.
 run "here-string word, then bash -c polling" DENY 10 cmd $'cat <<< text\nbash -c \'while true; do gh api user; sleep 5; done\''
 run "here-string word, then plain polling loop" DENY 10 cmd $'grep x <<< hello\nwhile true; do gh api user; sleep 5; done'
