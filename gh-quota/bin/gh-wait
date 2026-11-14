@@ -4,10 +4,16 @@
 # the 5000/hr limit, so only actual state changes cost a request.
 #
 #   gh-wait run <run-id> [-R owner/repo] [-i seconds] [-t timeout-minutes]
-#   gh-wait pr  <number> [-R owner/repo] [-i seconds] [-t timeout-minutes]
+#   gh-wait pr  <number> [-R owner/repo] [-i seconds] [-t timeout-minutes] [--sha commit]
+#   gh-wait commit <sha> [-R owner/repo] [-i seconds] [-t timeout-minutes]
 #
 # pr waits for the head commit's check runs, then for every check suite that has runs
 # (a job with needs: gets its check run only after the jobs it needs finish).
+# Right after a push the PR can still report its old head, whose checks already finished.
+# --sha waits until the PR head is that commit first; without it, a checkout on the PR's
+# branch whose HEAD is pushed (HEAD = @{push} or @{upstream}) waits for HEAD the same way.
+# commit waits the same way for one commit's checks (a push with no PR, such as to main),
+# including while its workflows have not started yet.
 #
 # Exit: 0 success, 1 finished but failed, 2 usage/API error or timeout (default 120 min).
 # Needs gh and jq.
@@ -16,19 +22,67 @@ set -uo pipefail
 usage() { sed -n 's/^#   //p' "$0" >&2; exit 2; }
 [ $# -ge 2 ] || usage
 kind=$1 target=$2; shift 2
-repo='' interval=15 timeout=120
+repo='' interval=15 timeout=120 want=''
 while [ $# -gt 0 ]; do
     [ $# -ge 2 ] || usage
     case $1 in
         -R|--repo) repo=$2; shift 2 ;;
         -i|--interval) interval=$2; shift 2 ;;
         -t|--timeout) timeout=$2; shift 2 ;;
+        --sha) want=$2; shift 2 ;;
         *) usage ;;
     esac
 done
 [[ $interval =~ ^[1-9][0-9]*$ && $timeout =~ ^[1-9][0-9]*$ ]] || usage
 command -v jq >/dev/null || { echo 'gh-wait: jq is required (brew install jq / apt install jq)' >&2; exit 2; }
 [ -n "$repo" ] || repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
+
+errf=$(mktemp) || exit 2
+trap 'rm -f "$errf"' EXIT
+# GH_WAIT_MINUTE (seconds per -t minute) only exists so tests can time out quickly.
+deadline=$((SECONDS + timeout * ${GH_WAIT_MINUTE:-60}))
+
+# hdr <name>: a response header's value (case-insensitive name).
+hdr() {
+    awk -v k="$1" 'NR > 1 && /^\r?$/ {exit}
+        {i = index($0, ":"); if (i && tolower(substr($0, 1, i - 1)) == tolower(k)) {v = substr($0, i + 1); gsub(/^ +|\r/, "", v); print v; exit}}' <<<"$resp"
+}
+# rate_wait: when $code/$resp say the primary rate limit is used up, sleep until the reset
+# (bounded by the deadline) and succeed; otherwise fail without sleeping.
+rate_wait() {
+    [[ $code =~ ^(403|429)$ ]] && [ "$(hdr X-Ratelimit-Remaining)" = 0 ] || return 1
+    local reset pause left
+    reset=$(hdr X-Ratelimit-Reset)
+    [[ $reset =~ ^[0-9]+$ ]] || reset=$(($(date +%s) + 60))
+    pause=$((reset - $(date +%s) + 1)) left=$((deadline - SECONDS))
+    [ $pause -gt $left ] && pause=$left
+    [ $pause -lt 1 ] && pause=1
+    echo "$(date +%H:%M:%S) rate limit used up, waiting ${pause}s for the reset" >&2
+    sleep $pause
+}
+# head_read: sets $sha and $ref to the PR's head.
+head_read() {
+    while :; do
+        resp=$(gh api -i "repos/$repo/pulls/$target" 2>"$errf")
+        code=$(head -1 <<<"$resp" | awk '{print $2}' | tr -d '\r')
+        if [ "$code" = 200 ]; then
+            read -r sha ref < <(awk 'f; /^\r?$/ {f=1}' <<<"$resp" | jq -r '.head.sha + " " + .head.ref')
+            [ -n "$sha" ] && return
+            exit 2
+        fi
+        rate_wait && continue
+        echo "$(date +%H:%M:%S) ${code:+HTTP $code }reading PR $target: $(head -3 "$errf" | tr '\r\n' '  ')" >&2
+        exit 2
+    done
+}
+# pushed_head <branch>: HEAD when the current checkout is on <branch> and HEAD is pushed.
+pushed_head() {
+    local head up
+    [ -n "$1" ] && [ "$(git symbolic-ref -q --short HEAD 2>/dev/null)" = "$1" ] || return 0
+    head=$(git rev-parse -q --verify HEAD 2>/dev/null) || return 0
+    up=$(git rev-parse -q --verify '@{push}' 2>/dev/null || git rev-parse -q --verify '@{upstream}' 2>/dev/null) || return 0
+    [ "$head" = "$up" ] && echo "$head"
+}
 
 case $kind in
     run)
@@ -37,22 +91,32 @@ case $kind in
         jq_state='if .status == "completed" then (if .conclusion == "success" then "ok" else "fail:" + .conclusion end) else "wait:" + .status end'
         ;;
     pr)
-        sha=$(gh api "repos/$repo/pulls/$target" -q .head.sha) || exit 2
+        head_read
+        [ -n "$want" ] || want=$(pushed_head "$ref")
+        if [ -n "$want" ] && [[ $sha != "$want"* ]]; then
+            echo "$(date +%H:%M:%S) wait:PR head is ${sha:0:7}, waiting for ${want:0:7}"
+            while [[ $sha != "$want"* ]]; do
+                if [ $SECONDS -ge $deadline ]; then
+                    echo "$(date +%H:%M:%S) timeout after ${timeout} min, PR head is ${sha:0:7}, never ${want:0:7}" >&2
+                    exit 2
+                fi
+                sleep "$interval"
+                head_read
+            done
+        fi
+        ;;
+    commit) sha=$target ;;
+    *) usage ;;
+esac
+if [ "$kind" != run ]; then
         path="repos/$repo/commits/$sha/check-runs?per_page=100"
         jq_state='.check_runs as $c
             | if ($c | length) == 0 then "wait:no checks yet"
               elif any($c[]; .status != "completed") then "wait:\([$c[] | select(.status != "completed")] | length) running (\([$c[] | select(.status != "completed") | .name] | join(", ")))"
               elif all($c[]; .conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") then "ok"
               else "fail:" + ([$c[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") | .name] | join(", ")) end'
-        ;;
-    *) usage ;;
-esac
+fi
 
-# hdr <name>: a response header's value (case-insensitive name).
-hdr() {
-    awk -v k="$1" 'NR > 1 && /^\r?$/ {exit}
-        {i = index($0, ":"); if (i && tolower(substr($0, 1, i - 1)) == tolower(k)) {v = substr($0, i + 1); gsub(/^ +|\r/, "", v); print v; exit}}' <<<"$resp"
-}
 # suites_done: every check suite of $sha that has check runs is completed and none failed.
 # Otherwise sets $suites to a wait: state and returns 1. A suite that failed after the check-runs
 # read means that snapshot is stale: wait, and the next poll re-reads the runs and reports the
@@ -93,11 +157,7 @@ suites_done() {
     suites='wait:checking workflows'
     return 1
 }
-errf=$(mktemp) || exit 2
-trap 'rm -f "$errf"' EXIT
 etag='' last='' errors=0 suite_errors=0 changed=$SECONDS beat=$SECONDS
-# GH_WAIT_MINUTE (seconds per -t minute) only exists so tests can time out quickly.
-deadline=$((SECONDS + timeout * ${GH_WAIT_MINUTE:-60}))
 while :; do
     if [ $SECONDS -ge $deadline ]; then
         echo "$(date +%H:%M:%S) timeout after ${timeout} min, last state: ${last:-unknown}" >&2
@@ -108,16 +168,7 @@ while :; do
     code=$(head -1 <<<"$resp" | awk '{print $2}' | tr -d '\r')
     err=$(head -3 "$errf" | tr '\r\n' '  ' | sed 's/ *$//')
     # Primary rate limit used up: wait for the reset (bounded by the deadline), not an error.
-    if [[ $code =~ ^(403|429)$ ]] && [ "$(hdr X-Ratelimit-Remaining)" = 0 ]; then
-        reset=$(hdr X-Ratelimit-Reset)
-        [[ $reset =~ ^[0-9]+$ ]] || reset=$(($(date +%s) + 60))
-        pause=$((reset - $(date +%s) + 1)) left=$((deadline - SECONDS))
-        [ $pause -gt $left ] && pause=$left
-        [ $pause -lt 1 ] && pause=1
-        echo "$(date +%H:%M:%S) rate limit used up, waiting ${pause}s for the reset" >&2
-        sleep $pause
-        continue
-    fi
+    rate_wait && continue
     case $code in
         304) errors=0 ;;
         401|404|422)
@@ -130,7 +181,7 @@ while :; do
             state=$(awk 'f; /^\r?$/ {f=1}' <<<"$resp" | jq -r "$jq_state") || exit 2
             # pr: a job with needs: has no check run until the jobs it needs finish, so all-green
             # runs can still have a workflow running. Ask the check suites once, only now.
-            if [ "$state" = ok ] && [ "$kind" = pr ] && ! suites_done; then
+            if [ "$state" = ok ] && [ "$kind" != run ] && ! suites_done; then
                 state=$suites
                 # Forget the ETag: unchanged check runs would answer 304 and never get here again.
                 etag=''

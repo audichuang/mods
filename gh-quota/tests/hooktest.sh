@@ -108,6 +108,10 @@ allow|gh-wait run 123 -R a/b
 allow|while read f; do echo $f; sleep 1; done < x
 allow|for i in 1 2; do gh api x; sleep 120; done
 allow|git commit -m "replace gh run watch with gh-wait"
+allow|grep -n "^DENY|gh run watch" tests/hooktest.sh
+allow|rg 'x|gh pr checks 3 --watch' notes.md
+allow|rg -n "a; watch -n 5 gh pr view" notes.md
+allow|grep -c 'x;gh run watch 1' log.txt
 allow|timeout 60 gh run view 1
 DENY|gh -R o/r run watch 1
 DENY|gh --repo o/r pr checks 5 --watch

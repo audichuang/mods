@@ -14,15 +14,20 @@ description: 等 GitHub Actions／CI 跑完、等 PR checks、checks 過了再�
 ```bash
 gh-wait run <run-id> -R owner/repo     # 等一個 workflow run
 gh-wait pr <number> -R owner/repo      # 等 PR head commit 的所有 checks
+gh-wait commit <sha> -R owner/repo     # 等一個 commit 的所有 checks（沒有 PR 的 push，run 還沒建出來也會等）
 ```
 
+- 一律放背景（`run_in_background`）。前景會被 Bash 工具的 10 分鐘上限砍掉，`timeout` 設再大也一樣；接 `| tail` 時 `$?` 是 tail 的，真正的結束碼要看 `${PIPESTATUS[0]}`。
+- 等通知就好：通知來之前不讀它的輸出檔、不 `pgrep`、不另外跑 `gh run view`／`gh pr checks`，那些都是在它旁邊再打一次 API。
+- push 完馬上等 PR：GitHub 可能還回報舊的 head commit，它的 checks 早就跑完了，會讀到舊結果。在 PR 分支的 checkout 裡跑、HEAD 也已經 push 時，`gh-wait pr` 會自己等 PR head 變成 HEAD；其他情況（例如不在那個 checkout 裡）帶 `--sha <剛推的 commit>`。不要用 `sleep` 墊時間。
+
 - 結束碼：0 成功、1 失敗（`pr` 印出失敗的 check，`run` 印出失敗的 job）、2 參數錯誤、API 錯誤或逾時（stderr 會寫是哪一種，並附上 gh 自己的錯誤訊息）。
-- 選項：`-i` 輪詢秒數（預設 15）、`-t` 逾時分鐘（預設 120）。
+- 選項：`-i` 輪詢秒數（預設 15）、`-t` 逾時分鐘（預設 120）、`--sha`（只有 `pr`：先等 PR head 變成這個 commit，可給短 sha）。
 - 需要 `gh` 和 `jq`；沒有 jq 會立刻說明並結束。
-- gh 沒登入會立刻結束（結束碼 2）；網路錯誤或 5xx 會重試，連續 5 次才放棄；額度用完（403／429 且剩 0）會等到重置時間再繼續，不算錯誤。
+- gh 沒登入會立刻結束（結束碼 2）；網路錯誤或 5xx 會重試，連續 5 次才放棄；額度用完（403／429 且剩 0）會等到重置時間再繼續，不算錯誤（一開始讀 PR head 那次也一樣）。
 - 它帶 ETag 做條件請求，狀態沒變時 GitHub 回 304，不扣額度；只有狀態真的變了才算一次。
 - 狀態 5 分鐘沒變會印 `unchanged for N min: …`（`pr` 模式會列出還在跑的 check）；一直卡住就是 CI 本身卡死，不是還在正常等。
-- `pr` 模式看 head commit 的 check runs（Actions 與其他 GitHub App），不看外部服務的舊式 commit status，最多讀 100 個 check；等待中 PR 又 push，它仍盯著開始時的那個 commit。每次 check runs 全綠時都會再查一次 check suites（這段空檔每輪多花 1 次請求），有 check run 的 suite 都跑完才算成功，所以 `needs:` 的後續 job 還沒建出 check run 時會印 `wait:N workflow still running` 繼續等，不會提早回 0。
+- `pr` 模式看 head commit 的 check runs（Actions 與其他 GitHub App），不看外部服務的舊式 commit status，最多讀 100 個 check；開始等 checks 之後 PR 又 push，它仍盯著原本那個 commit。每次 check runs 全綠時都會再查一次 check suites（這段空檔每輪多花 1 次請求），有 check run 的 suite 都跑完才算成功，所以 `needs:` 的後續 job 還沒建出 check run 時會印 `wait:N workflow still running` 繼續等，不會提早回 0。
 
 ## 等 checks 過了就合併
 

@@ -74,7 +74,8 @@ HEREDOC = re.compile(r'<<(-)?\s*([\'"]?)(\w+)\2')
 CODE, QUOTE, HEREDOC_BODY = 0, 1, 2
 MAX_DEPTH = 3
 
-HINT = ('等 CI 請改用 `gh-wait run <run-id> -R owner/repo` 或 `gh-wait pr <number> -R owner/repo`'
+HINT = ('等 CI 請改用 `gh-wait run <run-id> -R owner/repo`、`gh-wait pr <number> -R owner/repo`，'
+        '沒有 PR 的 push（等 run 出現再跑完）用 `gh-wait commit <sha> -R owner/repo`'
         '（ETag 條件請求，狀態沒變時 304 不扣額度；放背景跑，結束會通知）。'
         '如果是為了等 checks 過了就合併，考慮 `gh pr merge --auto`。')
 
@@ -234,16 +235,22 @@ def batch(cmd, mask, kind, start, end):
 def reason(cmd, depth=0):
     if 'gh' not in cmd and 'github' not in cmd.lower():
         return None
-    if WATCH.search(cmd):
+    mask = code_mask(cmd)
+
+    # A match inside quoted text is a search pattern or a message (grep "x|gh run …");
+    # a quoted command that does run (bash -c '…', ssh host '…') is judged as a payload below.
+    def runs(pattern):
+        return any(mask[m.end() - 1] != QUOTE for m in pattern.finditer(cmd))
+
+    if runs(WATCH):
         return '`gh run watch` 每輪打 2 個請求加每個執行中 job 1 個，會吃光共用的 5000/hr GitHub 額度。'
-    if CHECKS.search(cmd):
+    if runs(CHECKS):
         return '`gh pr checks --watch` 是固定間隔輪詢，會吃光共用的 5000/hr GitHub 額度。'
     if any(not AUTH.search(m.group(0)) for m in ANON_CURL.finditer(cmd)):
         return ('沒帶 token 的 curl／wget 打 api.github.com，吃的是出口 IP 共用的每小時 60 次匿名額度；'
                 '改用 `gh api <path>`（走帳號的 5000 次）。')
-    if WATCH_CMD.search(cmd):
+    if runs(WATCH_CMD):
         return '`watch … gh` 會每隔幾秒重跑 gh，會吃光共用的 5000/hr GitHub 額度。'
-    mask = code_mask(cmd)
     for kind, start, end in loops(cmd):
         if not gh_called(cmd, mask, start, end, depth):
             continue

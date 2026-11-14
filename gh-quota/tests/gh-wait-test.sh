@@ -81,7 +81,7 @@ check "run: failure lists failed jobs" 1 stdout-has=fail:failure 'stdout-has=fai
     argv-has=repos/o/r/actions/runs/7/jobs
 
 fresh
-echo abc123 > "$S/1.out"
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
 resp 2 '200 OK' '{"total_count":0,"check_runs":[]}' 'ETag: "e1"'
 resp 3 '200 OK' '{"check_runs":[{"name":"ci","status":"in_progress","conclusion":null},{"name":"lint","status":"completed","conclusion":"success"}]}' 'ETag: "e2"'
 resp 4 '200 OK' '{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"},{"name":"lint","status":"completed","conclusion":"skipped"}]}'
@@ -94,7 +94,7 @@ check "pr: no checks, running, ok" 0 'stdout-has=wait:no checks yet' 'stdout-has
 # A job with needs: has no check run until the jobs it needs finish, so every existing run can be
 # green while its workflow (check suite) is still in progress.
 fresh
-echo abc123 > "$S/1.out"
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
 resp 2 '200 OK' "$RUNS_OK" 'ETag: "e1"'
 resp 3 '200 OK' "$SUITES_RUNNING"
 resp 4 '200 OK' '{"check_runs":[{"name":"lint","status":"completed","conclusion":"success"},{"name":"test","status":"in_progress","conclusion":null}]}' 'ETag: "e2"'
@@ -106,7 +106,7 @@ check "pr: green runs but suite in progress waits for the suite" 0 'stdout-has=w
 
 # After the downgrade the stored ETag must go, or the next poll gets 304 and never re-checks the suites.
 fresh
-echo abc123 > "$S/1.out"
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
 resp 2 '200 OK' "$RUNS_OK" 'ETag: "e1"'
 resp 3 '200 OK' "$SUITES_RUNNING"
 resp 4 '200 OK' "$RUNS_OK" 'ETag: "e1"'
@@ -116,14 +116,14 @@ check "pr: downgrade to wait clears the ETag" 0 'stdout-has=wait:1 workflow stil
     argv-lacks=If-None-Match calls=5
 
 fresh
-echo abc123 > "$S/1.out"
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
 resp 2 '200 OK' "$RUNS_OK"
 resp 3 '200 OK' '{"check_suites":[{"app":{"name":"Some App"},"status":"queued","latest_check_runs_count":0},{"app":{"name":"GitHub Actions"},"status":"completed","conclusion":"success","latest_check_runs_count":1}]}'
 gw 20 pr 5 -R o/r -i 1
 check "pr: queued suite with no runs is ignored" 0 stdout-has=ok stdout-lacks=wait calls=3
 
 fresh
-echo abc123 > "$S/1.out"
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
 resp 2 '200 OK' "$RUNS_OK"
 resp 3 '502 Bad Gateway' '{"message":"Server Error"}'
 echo 'gh: Server Error (HTTP 502)' > "$S/3.err"; echo 1 > "$S/3.rc"
@@ -133,7 +133,7 @@ gw 20 pr 5 -R o/r -i 1
 check "pr: check-suites error is not ok, retried" 0 'stderr-has=HTTP 502' stdout-has=ok calls=5
 
 fresh
-echo abc123 > "$S/1.out"
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
 resp 2 '200 OK' "$RUNS_OK"
 printf 'To get started with GitHub CLI, please run:  gh auth login\n' > "$S/3.err"; echo 4 > "$S/3.rc"
 gw 20 pr 5 -R o/r -i 1
@@ -142,7 +142,7 @@ check "pr: check-suites not logged in stops" 2 'stderr-has=gh auth login' calls=
 # A downstream job can appear and fail between the check-runs read and the suites read: the suite
 # is completed but failed, and the green runs snapshot is stale. Re-read the runs, never report ok.
 fresh
-echo abc123 > "$S/1.out"
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
 resp 2 '200 OK' "$RUNS_OK"
 resp 3 '200 OK' '{"check_suites":[{"app":{"name":"GitHub Actions"},"status":"completed","conclusion":"failure","latest_check_runs_count":2}]}'
 resp 4 '200 OK' '{"check_runs":[{"name":"lint","status":"completed","conclusion":"success"},{"name":"e2e","status":"completed","conclusion":"failure"}]}'
@@ -151,7 +151,7 @@ check "pr: a suite that failed after a green runs read is not ok" 1 'stdout-has=
 
 # check-suites failing over and over must hit the same 5-error limit as the main request.
 fresh
-echo abc123 > "$S/1.out"
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
 for n in 2 4 6 8 10; do
     resp $n '200 OK' "$RUNS_OK"
     resp $((n + 1)) '503 Service Unavailable' '{"message":"Unavailable"}'
@@ -161,10 +161,84 @@ gw 30 pr 5 -R o/r -i 1
 check "pr: check-suites failing 5 times in a row gives up" 2 'stderr-has=HTTP 503' calls=11
 
 fresh
-echo abc123 > "$S/1.out"
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
 resp 2 '200 OK' '{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"},{"name":"lint","status":"completed","conclusion":"failure"}]}'
 gw 20 pr 5 -R o/r -i 1
 check "pr: failure names the check" 1 stdout-has=fail:lint calls=2
+
+# A push without a PR (straight to main): wait for the checks of that commit, appearing or not.
+fresh
+resp 1 '200 OK' '{"total_count":0,"check_runs":[]}' 'ETag: "e1"'
+resp 2 '200 OK' "$RUNS_OK" 'ETag: "e2"'
+resp 3 '200 OK' "$SUITES_DONE"
+gw 20 commit abc123 -R o/r -i 1
+check "commit: waits for its checks to appear and pass" 0 'stdout-has=wait:no checks yet' stdout-has=ok \
+    argv-has=repos/o/r/commits/abc123/check-runs argv-lacks=pulls calls=3
+
+# Quota used up when reading the PR head: wait for the reset like every later request.
+fresh
+resp 1 '403 Forbidden' '{"message":"API rate limit exceeded"}' 'X-Ratelimit-Remaining: 0' "X-Ratelimit-Reset: $(( $(date +%s) + 1 ))"
+echo 'gh: API rate limit exceeded (HTTP 403)' > "$S/1.err"; echo 1 > "$S/1.rc"
+resp 2 '200 OK' '{"head":{"sha":"abc123","ref":"feat"}}'
+resp 3 '200 OK' "$RUNS_OK"
+resp 4 '200 OK' "$SUITES_DONE"
+gw 20 pr 5 -R o/r -i 1
+check "pr: rate limit on the head read waits for the reset" 0 'stderr-has=rate limit' stdout-has=ok \
+    argv-has=commits/abc123/check-runs calls=4
+
+# Right after a push GitHub can still report the old head: --sha waits for the PR to reach it.
+fresh
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\"}}"
+resp 2 '200 OK' "{\"head\":{\"sha\":\"abc123\",\"ref\":\"feat\"}}"
+resp 3 '200 OK' "$RUNS_OK"
+resp 4 '200 OK' "$SUITES_DONE"
+gw 20 pr 5 -R o/r -i 1 --sha abc123
+check "pr --sha: waits for the PR head to reach the pushed commit" 0 'stdout-has=wait:PR head is old111' \
+    argv-has=repos/o/r/commits/abc123/check-runs argv-lacks=commits/old111 calls=4
+
+fresh
+resp 1 '200 OK' "{\"head\":{\"sha\":\"abc123def\",\"ref\":\"feat\"}}"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+gw 20 pr 5 -R o/r -i 1 --sha abc123
+check "pr --sha: a short sha matches the head" 0 stdout-lacks=wait:PR calls=3
+
+fresh
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\"}}"
+gw 20 pr 5 -R o/r -i 1 -t 1 --sha abc123
+check "pr --sha: never reached times out" 2 'stderr-has=timeout' 'stderr-has=PR head is old111'
+
+# Without --sha, a checkout on the PR's branch whose HEAD is pushed waits for that HEAD.
+R=$T/repo
+git init -q -b feat "$R" && git -C "$R" -c user.name=t -c user.email=t@t commit -q --allow-empty -m one
+git -C "$R" remote add origin "$T/none.git"
+git -C "$R" update-ref refs/remotes/origin/feat HEAD
+git -C "$R" config branch.feat.remote origin && git -C "$R" config branch.feat.merge refs/heads/feat
+HEAD_SHA=$(git -C "$R" rev-parse HEAD)
+fresh
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\"}}"
+resp 2 '200 OK' "{\"head\":{\"sha\":\"$HEAD_SHA\",\"ref\":\"feat\"}}"
+resp 3 '200 OK' "$RUNS_OK"
+resp 4 '200 OK' "$SUITES_DONE"
+cd "$R" || exit 1; gw 20 pr 5 -R o/r -i 1; cd - > /dev/null || exit 1
+check "pr: on the PR branch, waits for the pushed local HEAD" 0 'stdout-has=wait:PR head is old111' \
+    "argv-has=commits/$HEAD_SHA/check-runs" argv-lacks=commits/old111 calls=4
+
+fresh
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"other\"}}"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+cd "$R" || exit 1; gw 20 pr 5 -R o/r -i 1; cd - > /dev/null || exit 1
+check "pr: another branch's PR keeps its own head" 0 stdout-lacks=wait:PR argv-has=commits/old111/check-runs calls=3
+
+# An unpushed HEAD is not what GitHub will test.
+git -C "$R" -c user.name=t -c user.email=t@t commit -q --allow-empty -m two
+fresh
+resp 1 '200 OK' "{\"head\":{\"sha\":\"old111\",\"ref\":\"feat\"}}"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+cd "$R" || exit 1; gw 20 pr 5 -R o/r -i 1; cd - > /dev/null || exit 1
+check "pr: an unpushed local HEAD is ignored" 0 stdout-lacks=wait:PR argv-has=commits/old111/check-runs calls=3
 
 fresh
 resp 1 '200 OK' "$RUN_WAIT" 'Etag: W/"abc"'
