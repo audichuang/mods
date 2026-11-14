@@ -200,6 +200,13 @@ run "curl URL \\ newline -o (no token)" DENY 10 cmd $'curl -s https://api.github
 run "curl URL newline echo \$GH_TOKEN (no continuation)" DENY 10 cmd $'curl -s https://api.github.com/repos/a/b\necho $GH_TOKEN'
 run "git commit -F - heredoc quoting bash -c polling" allow 10 cmd $'git commit -F - <<\'EOF\'\nguard: catch polling inside (bash -c \'while true; do gh api x; sleep 5; done\') too\nEOF'
 run "bash heredoc script polling gh" DENY 10 cmd $'bash <<\'EOF\'\nwhile true; do gh api x; sleep 5; done\nEOF'
+# A heredoc fed to anything but a shell is text: a file's content, a script's data, a doc.
+run "python3 heredoc editing a doc that names the watch command" allow 10 cmd $'python3 - <<\'EOF\'\ns = open("MEMORY.md").read().replace("gh run watch 1", "gh-wait run 1")\nEOF'
+run "cat heredoc writing a doc that shows a polling loop" allow 10 cmd $'cat > notes.md <<\'EOF\'\n## Do not\nfor i in 1 2 3; do gh run list -L1; sleep 5; done\nEOF'
+run "tee heredoc writing a doc line with gh pr checks --watch" allow 10 cmd $'tee old.md <<EOF\ngh pr checks 1 --watch\nEOF'
+# Fed to a shell (directly, over ssh, or with sudo), the body runs: still judged.
+run "ssh heredoc polling gh" DENY 10 cmd $'ssh ubuntu bash -s <<\'EOF\'\nwhile true; do gh api x; sleep 5; done\nEOF'
+run "sudo sh heredoc running the watch command" DENY 10 cmd $'sudo sh <<EOF\ngh run watch 1\nEOF'
 # A here-string (<<<) is not a heredoc: the lines after it are still commands.
 run "here-string word, then bash -c polling" DENY 10 cmd $'cat <<< text\nbash -c \'while true; do gh api user; sleep 5; done\''
 run "here-string word, then plain polling loop" DENY 10 cmd $'grep x <<< hello\nwhile true; do gh api user; sleep 5; done'

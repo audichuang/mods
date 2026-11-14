@@ -71,6 +71,9 @@ AUTH = re.compile(r'(?i)authorization:|\$\(gh auth token\)|\$\{?(?:GITHUB_TOKEN|
 PAYLOAD = re.compile(SEP + r'(?P<w>' + WRAP + r'(?:' + PATH_PREFIX + r'(?:ba|z|da|k)?sh(?:\s+-[\w-]+)*\s+|'
                      + SSH + r'\s+|eval\s+))(?P<q>\'[^\']*\'|"(?:\\.|[^"\\])*")')
 HEREDOC = re.compile(r'<<(-)?\s*([\'"]?)(\w+)\2')
+# A heredoc fed to a shell (bash <<EOF, ssh host <<EOF) runs as commands; fed to anything else
+# (cat > f, python3 -, git commit -F -) its body is text and never counts as a gh call.
+SHELL_HEAD = re.compile(r'(?:^|[\s(])(?:\S*/)?(?:(?:ba|z|da|k)?sh|ssh|eval|source)\b')
 CODE, QUOTE, HEREDOC_BODY = 0, 1, 2
 MAX_DEPTH = 3
 
@@ -82,7 +85,8 @@ HINT = ('等 CI 請改用 `gh-wait run <run-id> -R owner/repo`、`gh-wait pr <nu
 
 def code_mask(cmd):
     """Classify every character in one linear pass: CODE, QUOTE (inside '…' or "…", except
-    a $(…) inside "…", which is code again) or HEREDOC_BODY. An unclosed quote stays code."""
+    a $(…) inside "…", which is code again) or HEREDOC_BODY (the body of a heredoc not fed to a
+    shell; a shell's heredoc body stays code). An unclosed quote stays code."""
     n = len(cmd)
     mask = bytearray(n)
     stack = []  # '"' while inside double quotes, '(' for each $( or ( opened inside them
@@ -128,25 +132,29 @@ def code_mask(cmd):
         elif c == '<' and cmd.startswith('<<', i):
             m = HEREDOC.match(cmd, i)
             if m:
-                heredocs.append((m.group(3), bool(m.group(1))))
+                # The command taking the heredoc: from the last separator up to `<<`.
+                head = cmd[max(cmd.rfind(sep, 0, i) for sep in '\n;&|(') + 1:i]
+                heredocs.append((m.group(3), bool(m.group(1)), bool(SHELL_HEAD.search(head))))
                 i = m.end()
             else:
                 i += 2
         elif c == '\n' and heredocs:
             i += 1
-            for delim, strip in heredocs:
+            for delim, strip, shell in heredocs:
                 start = i
                 while i < n:
                     end = cmd.find('\n', i)
                     end = n if end < 0 else end
                     line = cmd[i:end]
                     if (line.lstrip('\t') if strip else line) == delim:
-                        mask[start:i] = bytes([HEREDOC_BODY]) * (i - start)
+                        if not shell:
+                            mask[start:i] = bytes([HEREDOC_BODY]) * (i - start)
                         i = end + 1
                         break
                     i = end + 1
                 else:
-                    mask[start:n] = bytes([HEREDOC_BODY]) * (n - start)
+                    if not shell:
+                        mask[start:n] = bytes([HEREDOC_BODY]) * (n - start)
             heredocs = []
         else:
             i += 1
@@ -176,7 +184,7 @@ def payloads(cmd, mask, start=0, end=None):
 def gh_called(cmd, mask, start, end, depth):
     """True when cmd[start:end] runs gh: at a command position outside quoted text (echo "gh is
     up" is not a call; "$(gh …)" is), or inside a payload such as ssh host "gh api x"."""
-    if any(mask[m.start('gh')] != QUOTE for m in GH_CALL.finditer(cmd, start, end)):
+    if any(mask[m.start('gh')] == CODE for m in GH_CALL.finditer(cmd, start, end)):
         return True
     if depth < MAX_DEPTH:
         for inner in payloads(cmd, mask, start, end):
@@ -189,7 +197,9 @@ def loops(cmd):
     """Yield (keyword, start, end) for each loop, its text running to its own matching `done`
     (or to the end when unterminated), so nested loops and gh after a loop judge right.
     A `while read …` loop is reported as keyword 'read'."""
-    blank = QUOTED.sub(lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[-1], cmd)
+    mask = code_mask(cmd)
+    cmd_nb = ''.join(' ' if mask[i] == HEREDOC_BODY else c for i, c in enumerate(cmd))
+    blank = QUOTED.sub(lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[-1], cmd_nb)
     open_loops = []
     for m in LOOP_KW.finditer(blank):
         kind = m.group(1)
@@ -220,7 +230,7 @@ def batch(cmd, mask, kind, start, end):
     if any(gh_called(p, code_mask(p), 0, len(p), MAX_DEPTH) for p in payloads(cmd, mask, start, end)):
         return False
     uses = re.compile(r'\$\{?(?:' + '|'.join(names) + r')\b')
-    calls = [m for m in GH_CALL.finditer(cmd, start, end) if mask[m.start('gh')] != QUOTE]
+    calls = [m for m in GH_CALL.finditer(cmd, start, end) if mask[m.start('gh')] == CODE]
     for m in calls:
         # The request itself: its wrapper (ssh $h) through the first separator or redirection
         # outside quotes (--jq '.[] | .n' is one argument; > "out-$i" names a file and the
@@ -240,7 +250,7 @@ def reason(cmd, depth=0):
     # A match inside quoted text is a search pattern or a message (grep "x|gh run …");
     # a quoted command that does run (bash -c '…', ssh host '…') is judged as a payload below.
     def runs(pattern):
-        return any(mask[m.end() - 1] != QUOTE for m in pattern.finditer(cmd))
+        return any(mask[m.end() - 1] == CODE for m in pattern.finditer(cmd))
 
     if runs(WATCH):
         return '`gh run watch` 每輪打 2 個請求加每個執行中 job 1 個，會吃光共用的 5000/hr GitHub 額度。'
