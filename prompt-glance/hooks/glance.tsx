@@ -288,6 +288,8 @@ let noting: Promise<void> = Promise.resolve()
 
 /** Appends `event` to hud.log when it differs from the last line written; never throws. */
 function note($: EngineInterface, event: string): Promise<void> {
+  // one line per event: an error's own line breaks would leave lines without a timestamp
+  event = event.replace(/\s+/g, ' ').trim()
   if (event === lastNote || home === undefined) return noting
   lastNote = event
   const path = `${home}/${HUD_LOG}`

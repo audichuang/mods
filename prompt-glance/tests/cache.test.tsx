@@ -166,6 +166,8 @@ let gitRun: (() => Promise<unknown>) | undefined
 let usageHold: Promise<unknown> | undefined
 // set once the held answer has gone back to the module
 let usageHeldOut = false
+// how many times the module asked for session.usage
+let usageReads = 0
 // holds back the next turn.step answer until the promise settles: a request still streaming
 let stepHold: Promise<unknown> | undefined
 
@@ -182,11 +184,13 @@ function fakeEngine(
   gitRun = undefined
   usageHold = undefined
   usageHeldOut = false
+  usageReads = 0
   stepHold = undefined
   ghRate = ''
   modelId = 'claude-opus-5-5'
   ghExit = { exitCode: 0, stderr: '' }
   on('session.usage', async () => {
+    usageReads++
     const value = { startedAt: 0, context: {}, rateLimits: limits, ...(money ? { cost: { usd: money.usd } } : {}) }
     const hold = usageHold
     usageHold = undefined
@@ -1355,6 +1359,32 @@ describe('hud.log and headless runs', () => {
     await $.session.end({ reason: 'other' } as never)
     await settle()
     expect(argvs.filter(a => a.includes('status'))).toEqual([])
+    expect(usageReads).toBe(0)
     expect([...files.keys()].filter(p => p.endsWith('hud.log'))).toEqual([])
+  })
+
+  test('an SDK session that gains a surface starts drawing', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    const clock = mock.clock(on, { now: Date.now() })
+    fakeEngine(on, {}, calls, undefined, [], undefined, { clock: false })
+    let surfaces: string[] = []
+    on('session.surfaces', () => ({ value: surfaces }) as never)
+    await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
+    await clock.advance(6000)
+    expect(argvs.filter(a => a.includes('status'))).toEqual([])
+    surfaces = ['desktop']
+    await clock.advance(7000)
+    expect(argvs.filter(a => a.includes('status')).length).toBeGreaterThan(0)
+  })
+
+  test('an error with line breaks stays on one hud.log line', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, { HOME: '/h' }, calls)
+    const files = fakeFs(on)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await $.session.end({ reason: 'a\nb' } as never)
+    await settle()
+    const log = [...files.entries()].find(([p]) => p.endsWith('hud.log'))?.[1] ?? ''
+    expect(log).toContain('\tend a b\n')
   })
 })
