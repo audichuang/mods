@@ -3,9 +3,11 @@
 # Uses ETag conditional requests: a 304 (nothing changed) does not count against
 # the 5000/hr limit, so only actual state changes cost a request.
 #
-#   gh-wait run <run-id> [-R owner/repo] [-i seconds] [-t timeout-minutes]
-#   gh-wait pr  <number> [-R owner/repo] [-i seconds] [-t timeout-minutes] [--sha commit]
-#   gh-wait commit <sha> [-R owner/repo] [-i seconds] [-t timeout-minutes]
+#   gh-wait [-C dir] [-R owner/repo] [-i seconds] [-t timeout-minutes] [--workflow file-or-name]
+#   gh-wait run <run-id> [-R owner/repo] [-i seconds] [-t timeout-minutes] [--log-lines N]
+#   gh-wait pr  <number> [-R owner/repo] [-i seconds] [-t timeout-minutes] [--sha commit] [-C dir] [--workflow file-or-name]
+#   gh-wait commit <sha> [-R owner/repo] [-i seconds] [-t timeout-minutes] [--workflow file-or-name]
+#   All modes also accept: [-C dir] [--ignore glob ...] [--log-lines N]
 #
 # pr waits for the head commit's check runs, then for every check suite that has runs
 # (a job with needs: gets its check run only after the jobs it needs finish).
@@ -17,27 +19,52 @@
 # including while its workflows have not started yet.
 #
 # Exit: 0 success, 1 finished but failed, 2 usage/API error or timeout (default 120 min).
+# --workflow file-or-name waits for that workflow on the target SHA to appear,
+# then follows all matching runs, filtering known branches and PR events. Re-list
+# once after the first completion to include late runs; later arrivals are not tracked.
+# For reruns, the latest observed attempt of each run ID decides its result.
+# Completion prints run URLs or failing check URLs.
+# -C dir applies to every git lookup (also in pr mode). Auto mode selects a pushed
+# branch's open PR, or the HEAD commit when there is no PR or HEAD is detached.
+# --log-lines N prints up to three failed Actions jobs (default 40, 0 disables logs):
+# N lines ending at the first ##[error], or the last N lines when no error is annotated.
+# --ignore glob is repeatable (Bash name matching). Ignored checks do not block;
+# a completed run succeeds if all its failed jobs are ignored. Queued Actions suites
+# and unfinished non-ignored checks block. When only ignored checks remain running,
+# allow GH_WAIT_GRACE seconds (default 30) for new checks in that suite; new check IDs
+# restart the grace period. After an unchanged grace period that suite stops blocking.
+# Completed suites containing only ignored checks do not wait for stale snapshots.
+# All modes accept --log-lines N. Run progress adds one jobs request per changed
+# response (per 100 jobs), and no jobs requests on unchanged/304 responses.
+# SSH aliases use local ssh -G (GH_WAIT_SSH can select another executable).
 # Needs gh and jq.
 set -uo pipefail
 
 usage() { sed -n 's/^#   //p' "$0" >&2; exit 2; }
-[ $# -ge 2 ] || usage
-kind=$1 target=$2; shift 2
-repo='' interval=15 timeout=120 want=''
+kind=auto target='' repo='' interval=15 timeout=120 want='' dir=. workflow='' log_lines=40 ignore_count=0 auto_guess=0 head_etag=''
+ignore_globs=()
 while [ $# -gt 0 ]; do
     [ $# -ge 2 ] || usage
     case $1 in
+        run|pr|commit)
+            [ "$kind" = auto ] && [ -n "$2" ] || usage
+            kind=$1 target=$2; shift 2 ;;
+        -C) dir=$2; shift 2 ;;
         -R|--repo) repo=$2; shift 2 ;;
         -i|--interval) interval=$2; shift 2 ;;
         -t|--timeout) timeout=$2; shift 2 ;;
+        --ignore) [ -n "$2" ] || usage; ignore_globs+=("$2"); ignore_count=$((ignore_count + 1)); shift 2 ;;
+        --log-lines) log_lines=$2; shift 2 ;;
+        --workflow) workflow=$2; [ -n "$workflow" ] || usage; shift 2 ;;
         --sha) want=$2; shift 2 ;;
         *) usage ;;
     esac
 done
 [[ $interval =~ ^[1-9][0-9]*$ && $timeout =~ ^[1-9][0-9]*$ ]] || usage
+[[ $log_lines =~ ^(0|[1-9][0-9]*)$ ]] || usage
 [ -z "$want" ] || [ "$kind" = pr ] || usage
+[ -z "$workflow" ] || [ "$kind" != run ] || usage
 command -v jq >/dev/null || { echo 'gh-wait: jq is required (brew install jq / apt install jq)' >&2; exit 2; }
-[ -n "$repo" ] || repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
 
 errf=$(mktemp) || exit 2
 trap 'rm -f "$errf"' EXIT
@@ -62,47 +89,146 @@ rate_wait() {
     echo "$(date +%H:%M:%S) rate limit used up, waiting ${pause}s for the reset" >&2
     sleep $pause
 }
-# head_read: sets $sha, $ref and $head_repo (owner/name, empty for a deleted fork) to the PR's
-# head. Errors are handled like the main loop's: wait out the quota, retry 5 times, stop on 4xx.
-head_read() {
-    local tries=0 rc err
+# read_api <path> <label>: startup requests use the same error policy as polling.
+read_api() {
+    local tries=0 rc err conditional=${3:-}
     while :; do
-        resp=$(gh api -i "repos/$repo/pulls/$target" 2>"$errf")
+        [ $SECONDS -lt $deadline ] || { echo "gh-wait: timeout reading $2${sha:+, PR head is ${sha:0:7}}" >&2; exit 2; }
+        resp=$(gh api -i ${conditional:+-H "If-None-Match: $conditional"} "$1" 2>"$errf")
         rc=$?
         code=$(head -1 <<<"$resp" | awk '{print $2}' | tr -d '\r')
         err=$(head -3 "$errf" | tr '\r\n' '  ' | sed 's/ *$//')
+        if [ "$code" = 304 ] && [ -n "$conditional" ]; then return; fi
         if [ "$code" = 200 ]; then
-            read -r sha ref head_repo < <(awk 'f; /^\r?$/ {f=1}' <<<"$resp" \
-                | jq -r '"\(.head.sha // "") \(.head.ref // "") \(.head.repo.full_name // "")"' 2>/dev/null)
-            [ -n "$sha" ] && return
-            echo "$(date +%H:%M:%S) reading PR $target: the reply has no head commit" >&2
-            exit 2
+            body=$(awk 'f; /^\r?$/ {f=1}' <<<"$resp")
+            return
         fi
         rate_wait && continue
         if [[ $code =~ ^(401|404|422)$ ]] || { [ -z "$code" ] && { [ $rc -eq 4 ] || grep -qiE 'gh auth login|not logged in' "$errf"; }; }; then
-            echo "$(date +%H:%M:%S) ${code:+HTTP $code }reading PR $target: ${err:-gh exited $rc}" >&2
+            echo "$(date +%H:%M:%S) ${code:+HTTP $code }reading $2: ${err:-gh exited $rc}" >&2
             exit 2
         fi
         tries=$((tries + 1))
-        echo "$(date +%H:%M:%S) reading PR $target: ${code:+HTTP $code: }${err:-gh exited $rc} (attempt $tries)" >&2
+        echo "$(date +%H:%M:%S) reading $2: ${code:+HTTP $code: }${err:-gh exited $rc} (attempt $tries)" >&2
         [ $tries -ge 5 ] && exit 2
         sleep $((interval * tries))
     done
 }
+# head_read: sets $sha, $ref and $head_repo (owner/name, empty for a deleted fork) to the PR's
+# head. Errors are handled like the main loop's: wait out the quota, retry 5 times, stop on 4xx.
+head_read() {
+    read_api "repos/$repo/pulls/$target" "PR $target" "$head_etag"
+    [ "$code" != 304 ] || return 0
+    head_etag=$(hdr ETag)
+    local fields
+    fields=$(jq -r '"\(.head.sha // "") \(.head.ref // "") \(.head.repo.full_name // "")"' <<<"$body") || exit 2
+    read -r sha ref head_repo <<<"$fields"
+    [ -n "$sha" ] && return
+    echo "$(date +%H:%M:%S) reading PR $target: the reply has no head commit" >&2
+    exit 2
+}
+# All git operations honor -C, including the existing PR head inference.
+g() { git -C "$dir" "$@"; }
+push_remote() {
+    g config "branch.$1.pushRemote" || g config remote.pushDefault || g config "branch.$1.remote"
+}
+remote_repo() {
+    local url parent owner name authority host scheme ssh_alias=0
+    if [ "${2:-push}" = fetch ]; then
+        url=$(g remote get-url "$1" 2>/dev/null) || return 1
+    else
+        url=$(g remote get-url --push "$1" 2>/dev/null) || return 1
+    fi
+    url=$(tr '[:upper:]' '[:lower:]' <<<"$url")
+    case $url in
+        *://*)
+            scheme=${url%%://*}; authority=${url#*://}; authority=${authority%%/*}
+            host=${authority##*@}; host=${host%%:*}
+            [ "$scheme" != ssh ] || ssh_alias=1 ;;
+        *:*) authority=${url%%:*}; host=${authority##*@}; ssh_alias=1 ;;
+        *) return 1 ;;
+    esac
+    if [ "$host" != github.com ]; then
+        [ "$ssh_alias" = 1 ] && [ -n "$host" ] || return 1
+        host=$("${GH_WAIT_SSH:-ssh}" -G -- "$host" 2>/dev/null \
+            | awk 'tolower($1) == "hostname" {host=tolower($2)} END {print host}') || return 1
+        [ "$host" = github.com ] || return 1
+    fi
+    url=${url%/}; url=${url%.git}
+    parent=${url%/*}; name=${url##*/}; owner=${parent##*[/:]}
+    [ "$parent" != "$url" ] && [ -n "$owner" ] && [ -n "$name" ] || return 1
+    printf '%s/%s\n' "$owner" "$name"
+}
+
 # pushed_head <branch> <owner/name>: HEAD when the current checkout is on <branch>, pushes it to
 # <owner/name> on GitHub, and HEAD is pushed. A same-named branch elsewhere (a fork PR from main)
 # is someone else's commit.
 pushed_head() {
-    local head up remote url
-    [ -n "$1" ] && [ -n "$2" ] && [ "$(git symbolic-ref -q --short HEAD 2>/dev/null)" = "$1" ] || return 0
-    remote=$(git config "branch.$1.pushRemote" || git config remote.pushDefault || git config "branch.$1.remote") || return 0
-    url=$(git remote get-url "$remote" 2>/dev/null) || return 0
-    url=$(tr '[:upper:]' '[:lower:]' <<<"${url%.git}") || return 0
-    [[ $url == *[/:]$(tr '[:upper:]' '[:lower:]' <<<"$2") ]] || return 0
-    head=$(git rev-parse -q --verify HEAD 2>/dev/null) || return 0
-    up=$(git rev-parse -q --verify '@{push}' 2>/dev/null || git rev-parse -q --verify '@{upstream}' 2>/dev/null) || return 0
+    local head up remote pushed_repo
+    [ -n "$1" ] && [ -n "$2" ] && [ "$(g symbolic-ref -q --short HEAD 2>/dev/null)" = "$1" ] || return 0
+    remote=$(push_remote "$1") || return 0
+    pushed_repo=$(remote_repo "$remote") || return 0
+    [ "$(tr '[:upper:]' '[:lower:]' <<<"$pushed_repo")" = "$(tr '[:upper:]' '[:lower:]' <<<"$2")" ] || return 0
+    head=$(g rev-parse -q --verify HEAD 2>/dev/null) || return 0
+    up=$(g rev-parse -q --verify '@{push}' 2>/dev/null || g rev-parse -q --verify '@{upstream}' 2>/dev/null) || return 0
     [ "$head" = "$up" ] && echo "$head"
 }
+
+repo_explicit=0
+[ -z "$repo" ] || repo_explicit=1
+if [ "$kind" = auto ]; then
+    local_head=$(g rev-parse -q --verify HEAD 2>/dev/null) || { echo 'gh-wait: auto mode needs a git checkout with HEAD' >&2; exit 2; }
+    branch=$(g symbolic-ref -q --short HEAD 2>/dev/null || :)
+    local_branch=$branch
+    remote=$(push_remote "${branch:-HEAD}" || echo origin)
+    pushed_repo=$(remote_repo "$remote" || :)
+    [ -n "$repo" ] || repo=$pushed_repo
+    if [ -n "$branch" ]; then
+        up=$(g rev-parse -q --verify '@{push}' 2>/dev/null || g rev-parse -q --verify '@{upstream}' 2>/dev/null || :)
+        if [ "$local_head" != "$up" ]; then
+            echo "gh-wait: HEAD is not pushed; push first or pass gh-wait commit $local_head" >&2
+            exit 2
+        fi
+        push_ref=$(g rev-parse --symbolic-full-name '@{push}' 2>/dev/null || g rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null)
+        branch=${push_ref#refs/remotes/}; branch=${branch#*/}
+    fi
+fi
+[ -n "$repo" ] || repo=$(cd -- "$dir" && gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
+if [ "$kind" = auto ]; then
+    target='' reason='detached HEAD' commit_repo=$repo
+    if [ -n "$branch" ]; then
+        upstream_repo=''
+        if [ "$repo_explicit" = 0 ]; then
+            upstream_remote=$(g config "branch.$local_branch.remote" || :)
+            upstream_repo=$(remote_repo "$upstream_remote" fetch || :)
+        fi
+        owner=${pushed_repo:-$repo}; owner=${owner%%/*}
+        query=$(jq -rn --arg head "$owner:$branch" '$head | @uri') || exit 2
+        read_api "repos/$repo/pulls?head=$query&state=open" 'open PRs'
+        target=$(jq -r '.[0].number // empty' <<<"$body") || exit 2
+        if [ -z "$target" ] && [ "$repo_explicit" = 0 ]; then
+            if [ -n "$upstream_repo" ] && [ "$upstream_repo" != "$pushed_repo" ]; then
+                repo=$upstream_repo
+            elif [ -n "$pushed_repo" ]; then
+                read_api "repos/$pushed_repo" 'push repository'
+                parent_repo=$(jq -r '.parent.full_name // empty' <<<"$body") || exit 2
+                [ -z "$parent_repo" ] || repo=$parent_repo
+            fi
+            if [ "$repo" != "$commit_repo" ]; then
+                read_api "repos/$repo/pulls?head=$query&state=open" 'open PRs'
+                target=$(jq -r '.[0].number // empty' <<<"$body") || exit 2
+            fi
+        fi
+        reason='no open PR'
+    fi
+    if [ -n "$target" ]; then
+        kind=pr want=$local_head auto_guess=1
+        echo "gh-wait: PR #$target (head ${local_head:0:7})" >&2
+    else
+        kind=commit target=$local_head repo=$commit_repo
+        echo "gh-wait: commit ${local_head:0:7}, $reason" >&2
+    fi
+fi
 
 case $kind in
     run)
@@ -115,8 +241,8 @@ case $kind in
         # A guessed HEAD can be wrong (the PR already moved past it), so its wait is bounded;
         # GitHub catches up with a push within seconds. An explicit --sha waits to the deadline.
         catchup=$deadline
-        if [ -z "$want" ]; then
-            want=$(pushed_head "$ref" "$head_repo")
+        if [ -z "$want" ] || [ "$auto_guess" = 1 ]; then
+            [ -n "$want" ] || want=$(pushed_head "$ref" "$head_repo")
             catchup=$((SECONDS + ${GH_WAIT_CATCHUP:-120}))
         fi
         if [ -n "$want" ] && [[ $sha != "$want"* ]]; then
@@ -135,11 +261,20 @@ case $kind in
             done
         fi
         ;;
-    commit) sha=$target ;;
+    commit)
+        if [[ $target =~ ^[0-9a-fA-F]{40}$ ]]; then
+            sha=$target
+        else
+            query=$(jq -rn --arg target "$target" '$target | @uri') || exit 2
+            read_api "repos/$repo/commits/$query" 'commit'
+            sha=$(jq -er '.sha // empty' <<<"$body") || exit 2
+        fi
+        ;;
     *) usage ;;
 esac
 if [ "$kind" != run ]; then
         path="repos/$repo/commits/$sha/check-runs?per_page=100"
+        # shellcheck disable=SC2016 # These are jq variables.
         jq_state='.check_runs as $c
             | if ($c | length) == 0 then "wait:no checks yet"
               elif any($c[]; .status != "completed") then "wait:\([$c[] | select(.status != "completed")] | length) running (\([$c[] | select(.status != "completed") | .name] | join(", ")))"
@@ -147,24 +282,177 @@ if [ "$kind" != run ]; then
               else "fail:" + ([$c[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") | .name] | join(", ")) end'
 fi
 
+workflow_pending=0 workflow_path='' workflow_branch='' workflow_pr='' workflow_head_repo=''
+workflow_queue='[]' workflow_done='{}' workflow_relisted=0 workflow_listing_etag=''
+if [ -n "$workflow" ]; then
+    if [ "$kind" = pr ]; then
+        workflow_branch=$ref workflow_pr=$target workflow_head_repo=$head_repo
+    fi
+    case $workflow in
+        *.yml|*.yaml) workflow_id=${workflow##*/} ;;
+        *)
+            workflows='[]' page=1
+            while :; do
+                read_api "repos/$repo/actions/workflows?per_page=100&page=$page" 'workflows'
+                workflows=$(printf '%s\n' "$workflows" "$body" | jq -cs '.[0] + .[1].workflows') || exit 2
+                [[ $(hdr Link) == *'rel="next"'* ]] || break
+                page=$((page + 1))
+            done
+            workflow_id=$(jq -r --arg name "$workflow" '[.[] | select(.name == $name)]
+                | if length == 1 then .[0].id else empty end' <<<"$workflows") || exit 2
+            [ -n "$workflow_id" ] || { echo "gh-wait: workflow name '$workflow' is missing or ambiguous; pass its file name" >&2; exit 2; }
+            ;;
+    esac
+    workflow_id=$(jq -rn --arg id "$workflow_id" '$id | @uri') || exit 2
+    query=$(jq -rn --arg sha "$sha" '$sha | @uri') || exit 2
+    workflow_path="repos/$repo/actions/workflows/$workflow_id/runs?head_sha=$query&per_page=100"
+    if [ -n "$workflow_branch" ]; then
+        query=$(jq -rn --arg branch "$workflow_branch" '$branch | @uri') || exit 2
+        workflow_path+="&branch=$query"
+    fi
+    path=$workflow_path workflow_pending=1
+fi
+
+# Keep all matching run IDs, using the latest attempt of each ID. Discovery follows
+# every page; after the first completion, one conditional re-list captures late runs.
+workflow_collect() {
+    local runs='[]' batch page=1
+    workflow_listing_etag=$etag
+    while :; do
+        batch=$(jq -ce '.workflow_runs | if type == "array" then . else error("missing workflow_runs") end' <<<"$body") || exit 2
+        runs=$(printf '%s\n' "$runs" "$batch" | jq -cs '.[0] + .[1]') || exit 2
+        [[ $(hdr Link) == *'rel="next"'* ]] || break
+        page=$((page + 1))
+        read_api "$workflow_path&page=$page" 'workflow runs'
+    done
+    workflow_queue=$(printf '%s\n' "$workflow_queue" "$runs" | jq -cs \
+        --arg branch "$workflow_branch" --arg pr "$workflow_pr" --arg head_repo "$workflow_head_repo" '
+        .[0] + [.[1][]
+            | select(($branch == "" or .head_branch == $branch)
+                and ($pr == "" or (.event != "pull_request" and .event != "pull_request_target")
+                    or any(.pull_requests[]?; (.number | tostring) == $pr)
+                    or ($head_repo != "" and .head_repository.full_name == $head_repo and .head_branch == $branch)))
+            | {id, run_attempt:(.run_attempt // 1)}]
+        | group_by(.id) | map(max_by(.run_attempt))') || exit 2
+}
+workflow_next() {
+    local next result
+    next=$(printf '%s\n' "$workflow_queue" "$workflow_done" | jq -cs '
+        .[1] as $done | [.[0][] | select(.run_attempt > ($done[(.id | tostring)].attempt // 0))] | .[0] // empty') || exit 2
+    if [ -z "$next" ]; then
+        result=$(jq -r 'if any(.[]; .result != 0) then 1 else 0 end' <<<"$workflow_done") || exit 2
+        exit "$result"
+    fi
+    target=$(jq -r '.id' <<<"$next") || exit 2
+    workflow_attempt=$(jq -r '.run_attempt' <<<"$next") || exit 2
+    echo "gh-wait: workflow $workflow run $target (attempt $workflow_attempt)" >&2
+    kind=run workflow_pending=0 etag='' last='' run_snapshot='' jobs='[]' jobs_valid=0 last_jobs='' last_ignored=''
+    path="repos/$repo/actions/runs/$target"
+    jq_state='if .status == "completed" then (if .conclusion == "success" then "ok" else "fail:" + .conclusion end) else "wait:" + .status end'
+}
+workflow_finish() {
+    workflow_done=$(printf '%s\n' "$workflow_done" "$body" | jq -cs \
+        --arg id "$target" --arg result "$1" '
+        .[0] + {($id):{attempt:(.[1].run_attempt // 1),result:($result | tonumber)}}') || exit 2
+    if [ "$workflow_relisted" = 0 ]; then
+        workflow_relisted=1 workflow_pending=2 path=$workflow_path etag=$workflow_listing_etag
+    else
+        workflow_next
+    fi
+}
+
+ignored_name() {
+    local pattern
+    for pattern in "${ignore_globs[@]-}"; do
+        # shellcheck disable=SC2053 # The option is deliberately a Bash glob.
+        [ -n "$pattern" ] && [[ $1 == $pattern ]] && return 0
+    done
+    return 1
+}
+# Partition a JSON array using Bash glob matching, preserving full names and metadata.
+split_ignored() {
+    local item name items yes='' no=''
+    kept=$1 omitted='[]'
+    [ "$ignore_count" -gt 0 ] || return 0
+    items=$(jq -c '.[]' <<<"$1") || exit 2
+    while IFS= read -r item; do
+        [ -n "$item" ] || continue
+        name=$(jq -r '.name' <<<"$item") || exit 2
+        if ignored_name "$name"; then no+="$item"$'\n'; else yes+="$item"$'\n'; fi
+    done <<<"$items"
+    kept=$(jq -cs '.' <<<"$yes") || exit 2
+    omitted=$(jq -cs '.' <<<"$no") || exit 2
+}
+report_ignored() {
+    local names
+    names=$(jq -r '[.[].name] | sort | join(", ")' <<<"$omitted") || exit 2
+    if [ -n "$names" ] && [ "$names" != "$last_ignored" ]; then
+        echo "gh-wait: ignored $1: $names"
+        last_ignored=$names
+    fi
+}
+# A null/unfinished conclusion is not evidence that an ignored job caused failure.
+bad_jobs='[.[] | select(.status == "completed" and .conclusion != "success"
+    and .conclusion != "skipped" and .conclusion != "neutral")]'
+checks_all='[]' ignored_checks='[]' run_jobs='[]' last_ignored='' suite_grace='{}'
+
+# URLs come from the same snapshot that decided completion; no lookup is needed.
+print_urls() {
+    if [ "$kind" = run ]; then
+        printf 'https://github.com/%s/actions/runs/%s\n' "$repo" "$target"
+    else
+        printf '%s\n' "$checks_all" "$body" | jq -rs --arg result "$state" '
+            .[0] as $all | .[1] | [if $result == "ok" then $all[] else .check_runs[] end
+            | select($result == "ok" or (.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral"))
+            | .html_url // .details_url // empty
+            | if $result == "ok" then sub("/job/[0-9]+.*$"; "") else . end] | unique[]'
+    fi
+}
+
 # suites_done: every check suite of $sha that has check runs is completed and none failed.
 # Otherwise sets $suites to a wait: state and returns 1. A suite that failed after the check-runs
 # read means that snapshot is stale: wait, and the next poll re-reads the runs and reports the
 # failure by name. A failed request counts as not done (retried next poll, at most 5 in a row),
 # except gh not logged in or 401/404/422, which stop like the main request does.
 suites_done() {
-    local out rc code body
+    local out rc code body evaluation
     out=$(gh api -i "repos/$repo/commits/$sha/check-suites?per_page=100" 2>"$errf")
     rc=$?
     code=$(head -1 <<<"$out" | awk '{print $2}' | tr -d '\r')
     if [ "$code" = 200 ]; then
         body=$(awk 'f; /^\r?$/ {f=1}' <<<"$out")
         suite_errors=0
-        suites=$(jq -r '[.check_suites[]? | select(.latest_check_runs_count > 0)] as $s
+        evaluation=$(printf '%s\n' "$checks_all" "$ignored_checks" "$body" "$suite_grace" | jq -cs \
+            --arg now "$SECONDS" --arg grace "${GH_WAIT_GRACE:-30}" '
+            .[0] as $checks | .[1] as $ignored | .[3] as $history | .[2] | [.check_suites[]? | select(.latest_check_runs_count > 0
+                or (.status != "completed" and (.app.slug == "github-actions" or .app.name == "GitHub Actions")))
+                | . as $suite
+                | [$checks[] | select(.check_suite.id != null and .check_suite.id == $suite.id)] as $seen
+                | [$ignored[] | select(.check_suite.id != null and .check_suite.id == $suite.id)] as $omit
+                | ([$seen[] | .id // .name] | sort) as $ids
+                | (.status != "completed" and ($seen | length) > 0
+                    and .latest_check_runs_count <= ($seen | length)
+                    and any($omit[]; .status != "completed")
+                    and all(($seen - $omit)[]; .status == "completed")) as $relax
+                | ($history[(.id | tostring)] as $old
+                    | if $old.ids == $ids then $old.since else ($now | tonumber) end) as $since
+                | {suite:., ids:$ids, since:$since, relax:$relax,
+                    blocks:(if $relax then (($now | tonumber) - $since) < ($grace | tonumber)
+                    elif ($omit | length) == 0 or .latest_check_runs_count > ($seen | length) then true
+                    elif .status != "completed" then true
+                    elif ($seen | length) == ($omit | length) then false
+                    elif .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral" then
+                        all($omit[]; .status != "completed" or .conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral")
+                    else false end)}] as $rows
+            | {grace:(reduce ($rows[] | select(.relax)) as $row ({};
+                    .[($row.suite.id | tostring)] = {ids:$row.ids, since:$row.since})),
+                state:([$rows[] | select(.blocks) | .suite] as $s
             | [$s[] | select(.status != "completed")] as $running
             | if ($running | length) > 0 then "wait:\($running | length) workflow still running (\([$running[] | .app.name // "?"] | unique | join(", ")))"
               elif any($s[]; .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") then "wait:a workflow finished after the check-runs read, re-reading"
-              else "ok" end' <<<"$body") || exit 2
+              else "ok" end)}') || exit 2
+        suite_grace=$(jq -c '.grace' <<<"$evaluation") || exit 2
+        suites=$(jq -r '.state' <<<"$evaluation") || exit 2
         [ "$suites" = ok ]
         return
     fi
@@ -187,6 +475,97 @@ suites_done() {
     suites='wait:checking workflows'
     return 1
 }
+# Older gh versions reject the flag before making a request. Retry only that case.
+fetch_job_log() {
+    gh api --allow-escape-sequences "$1" 2>"$errf" && return 0
+    grep -qF 'unknown flag: --allow-escape-sequences' "$errf" || return 1
+    gh api "$1" 2>"$errf"
+}
+# Strip terminal sequences before tailing. State spans records for multiline OSC.
+plain_log() {
+    LC_ALL=C awk '
+        BEGIN {esc = "\033"; bell = "\007"}
+        {
+            for (i = 1; i <= length($0); i++) {
+                c = substr($0, i, 1)
+                if (c == "\r") continue
+                if (state == "osc") {
+                    if (c == bell) state = ""
+                    else if (c == esc) state = "osc-esc"
+                } else if (state == "osc-esc") {
+                    if (c == "\\" || c == bell) state = ""
+                    else if (c != esc) state = "osc"
+                } else if (state == "csi") {
+                    if (c == esc) state = "esc"
+                    else if (c ~ /[@-~]/) state = ""
+                } else if (state == "esc") {
+                    if (c == "[") state = "csi"
+                    else if (c == "]") state = "osc"
+                    else if (c !~ /[ -\/]/ && c != esc) state = ""
+                } else if (c == esc) state = "esc"
+                else if (c != bell) out = out c
+            }
+            if (state != "osc" && state != "osc-esc") {print out; out = ""}
+        }
+        END {if (out != "") print out}
+    '
+}
+# Only Actions check IDs are job IDs. Other apps keep their check URLs without log requests.
+# Log reads are best effort and never change a completed failure's exit code.
+failure_details() {
+    local failed job id items
+    if [ "$kind" = run ]; then
+        failed=$run_jobs
+    else
+        failed=$(jq -c '[.check_runs[] | select(.app.slug == "github-actions")]' <<<"$body") || exit 2
+    fi
+    items=$(jq -c '[.[] | select(.status == "completed" and .conclusion != "success"
+        and .conclusion != "skipped" and .conclusion != "neutral")][0:3][]' <<<"$failed") || exit 2
+    while IFS= read -r job; do
+        [ -n "$job" ] || continue
+        jq -r '"failed job: \(.name) (\(.conclusion))", (.html_url // .details_url // empty)' <<<"$job" || exit 2
+        id=$(jq -r '.id // empty' <<<"$job") || exit 2
+        [ "$log_lines" -gt 0 ] && [ -n "$id" ] || continue
+        # Freeze the window at the first error, but drain cleanup to avoid broken pipes.
+        if ! fetch_job_log "repos/$repo/actions/jobs/$id/logs" | plain_log \
+            | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z //' \
+            | awk -v n="$log_lines" '
+                !found {
+                    lines[NR % n] = $0
+                    last = NR
+                    if (index($0, "##[error]")) found = 1
+                }
+                END {
+                    first = last - n + 1
+                    if (first < 1) first = 1
+                    for (i = first; i <= last; i++) print lines[i % n]
+                }
+            '; then
+            echo "gh-wait: logs for job $id: $(head -3 "$errf")" >&2
+        fi
+    done <<<"$items"
+}
+
+# One jobs-list request (per 100 jobs) per changed run body; never on a 304.
+# Progress is advisory: a jobs read error leaves the workflow's conclusion intact.
+read_jobs() {
+    local data picture
+    jobs_valid=0 jobs='[]'
+    if ! data=$(gh api "$path/jobs?per_page=100" --paginate 2>"$errf"); then
+        echo "gh-wait: reading jobs: $(head -3 "$errf")" >&2
+        return
+    fi
+    jobs=$(jq -cs '[.[].jobs[]]' <<<"$data") || exit 2
+    jobs_valid=1
+    picture=$(jq -r '"jobs \([.[] | select(.status == "completed")] | length)/\(length) done, running: "
+        + ([.[] | select(.status == "in_progress") | .name] | sort | if length > 0 then join(", ") else "none" end)' <<<"$jobs") || exit 2
+    if [ "$picture" != "$last_jobs" ]; then
+        echo "$(date +%H:%M:%S) $picture"
+        last_jobs=$picture
+    fi
+}
+run_snapshot='' jobs='[]' jobs_valid=0 last_jobs=''
+
 etag='' last='' errors=0 suite_errors=0 changed=$SECONDS beat=$SECONDS
 while :; do
     if [ $SECONDS -ge $deadline ]; then
@@ -200,7 +579,10 @@ while :; do
     # Primary rate limit used up: wait for the reset (bounded by the deadline), not an error.
     rate_wait && continue
     case $code in
-        304) errors=0 ;;
+        304)
+            errors=0
+            if [ "$workflow_pending" = 2 ]; then workflow_next; continue; fi
+            ;;
         401|404|422)
             echo "$(date +%H:%M:%S) HTTP $code for $path${err:+: $err}" >&2
             exit 2
@@ -208,7 +590,42 @@ while :; do
         200)
             errors=0
             etag=$(hdr ETag)
-            state=$(awk 'f; /^\r?$/ {f=1}' <<<"$resp" | jq -r "$jq_state") || exit 2
+            body=$(awk 'f; /^\r?$/ {f=1}' <<<"$resp")
+            if [ "$workflow_pending" != 0 ]; then
+                workflow_collect
+                if [ "$workflow_queue" != '[]' ] || [ "$workflow_pending" = 2 ]; then
+                    workflow_next
+                    continue
+                fi
+                state="wait:no runs yet for $workflow"
+            else
+                if [ "$kind" != run ]; then
+                    checks_all=$(jq -c '.check_runs' <<<"$body") || exit 2
+                    split_ignored "$checks_all"
+                    ignored_checks=$omitted
+                    report_ignored checks
+                    body=$(printf '%s\n' "$kept" "$body" | jq -cs '.[0] as $checks | .[1] | .check_runs = $checks') || exit 2
+                fi
+                state=$(jq -r "$jq_state" <<<"$body") || exit 2
+                if [ "$kind" = run ] && [ -n "$workflow_path" ]; then
+                    attempt=$(jq -r '.run_attempt // 1' <<<"$body") || exit 2
+                    if [ "$attempt" -lt "$workflow_attempt" ]; then state="wait:run attempt $workflow_attempt"; fi
+                fi
+                if [ "$kind" != run ] && [ "$kept" = '[]' ] && [ "$ignored_checks" != '[]' ]; then state=ok; fi
+            fi
+            if [ "$kind" = run ] && [ "$body" != "$run_snapshot" ]; then
+                run_snapshot=$body
+                read_jobs
+            fi
+            if [ "$kind" = run ]; then
+                split_ignored "$jobs"
+                run_jobs=$kept
+                report_ignored jobs
+                bad_kept=$(jq -c "$bad_jobs" <<<"$kept") || exit 2
+                bad_omitted=$(jq -c "$bad_jobs" <<<"$omitted") || exit 2
+                if [[ $state == fail:* ]] && [ "$jobs_valid" = 1 ] \
+                    && [ "$bad_kept" = '[]' ] && [ "$bad_omitted" != '[]' ]; then state=ok; fi
+            fi
             # pr: a job with needs: has no check run until the jobs it needs finish, so all-green
             # runs can still have a workflow running. Ask the check suites once, only now.
             if [ "$state" = ok ] && [ "$kind" != run ] && ! suites_done; then
@@ -222,11 +639,19 @@ while :; do
             fi
             last=$state
             case $state in
-                ok) exit 0 ;;
+                ok)
+                    print_urls || exit 2
+                    if [ -n "$workflow_path" ]; then workflow_finish 0; continue; fi
+                    exit 0 ;;
+
                 fail:*)
+                    print_urls || exit 2
                     if [ "$kind" = run ]; then
-                        gh api "$path/jobs?per_page=100" -q '[.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "\(.name) (\(.conclusion))"] | "failed jobs: " + join(", ")' 2>/dev/null
+                        jq -r '[.[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")
+                            | "\(.name) (\(.conclusion))"] | "failed jobs: " + join(", ")' <<<"$run_jobs" || exit 2
                     fi
+                    failure_details
+                    if [ -n "$workflow_path" ]; then workflow_finish 1; continue; fi
                     exit 1
                     ;;
             esac
