@@ -1,6 +1,6 @@
 #!/bin/bash
 # Pipe-test gh-quota-guard. Cases are "want|command" per line; want is allow, DENY, or
-# DENY:<text the deny reason must contain>. Every run also checks the hook's exit code,
+# DENY:<text the deny reason must contain>, or DENY$:<text the reason must end with>. Every run also checks the hook's exit code,
 # stderr and output shape (valid deny JSON, or nothing at all). Prints only "ok ..." on success.
 H=${1:-$(dirname "$0")/../hooks/gh-quota-guard.py}
 export PYTHONDONTWRITEBYTECODE=1
@@ -37,6 +37,8 @@ else:
             probs.append('bad deny JSON: ' + p.stdout[:200])
         elif not o['permissionDecisionReason'] or sub not in o['permissionDecisionReason']:
             probs.append(f'reason lacks {sub!r}: ' + o['permissionDecisionReason'])
+        elif kind == 'DENY$' and not o['permissionDecisionReason'].endswith(sub):
+            probs.append(f'reason goes on past {sub!r}: ' + o['permissionDecisionReason'])
     except (ValueError, KeyError, TypeError):
         probs.append('got allow' if not p.stdout else 'not deny JSON: ' + p.stdout[:200])
 if probs:
@@ -224,7 +226,11 @@ DENY:gh-wait run <run-id>|while true; do gh api "/repos/$O/$R/actions/runs/$ID";
 DENY:不帶參數|watch -n 5 "gh api repos/o/r/actions/runs/1 -q .status"
 DENY:gh-wait commit <sha> -R owner/repo|while true; do gh issue list; sleep 5; done
 DENY:推 tag 等 release 務必加 `--workflow <檔名>`|while true; do gh issue list; sleep 5; done
-DENY:改用 `gh api <path>`（走帳號的 5000 次）。|curl -s https://api.github.com/repos/a/b/releases/latest
+DENY$:改用 `gh api <path>`（走帳號的 5000 次）。|curl -s https://api.github.com/repos/a/b/releases/latest
+DENY$:改用 `gh api <path>`（走帳號的 5000 次）。|curl -s https://api.github.com/repos/actions/checkout/releases/latest
+DENY$:改用 `gh api <path>`（走帳號的 5000 次）。|curl -s https://api.github.com/repos/me/check-runs-demo/releases
+DENY:不帶參數|s=$(curl -s https://api.github.com/repos/a/b/pulls/5)
+DENY:不帶參數|curl -s 'https://api.github.com/repos/a/b/pulls/5?x=1'
 DENY:不帶參數|curl -s https://api.github.com/repos/a/b/actions/runs?head_sha=abc
 DENY:不帶參數|curl -s https://api.github.com/repos/a/b/commits/abc/check-runs
 DENY:gh-wait run 123 -R a/b|ssh ubuntu 'gh run watch 123 -R a/b'

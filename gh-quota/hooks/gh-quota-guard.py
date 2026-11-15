@@ -64,7 +64,7 @@ UNIT = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
 # still belongs to that curl.
 ARGS = r'(?:[^;&|\n\\]|\\[\s\S])*'
 ANON_CURL = re.compile(POS + r'(?P<cmd>curl|wget)\b' + ARGS + r'(?i:api\.github\.com)(?!/rate_limit\b)' + ARGS)
-CI_PATH = re.compile(r'/(?:actions/|check-runs|check-suites|statuses?\b|commits/[^/\s]+/(?:status|check)|pulls/\d+/?(?:[\s"\']|$))')
+CI_PATH = re.compile(r'/repos/[^/\s]+/[^/\s]+/(?:actions/|check-runs|check-suites|statuses?\b|commits/[^/\s]+/(?:status|check)|pulls/\d+(?![\w-]))')
 AUTH = re.compile(r'(?i)authorization:|\$\(gh auth token\)|\$\{?(?:GITHUB_TOKEN|GH_TOKEN)\b')
 # Wrappers whose quoted argument is itself a command line (sh -c, ssh host, eval): their
 # loops are hidden from loops(), so reason() runs again on the unquoted argument. Group w
