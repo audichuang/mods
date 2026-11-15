@@ -32,7 +32,7 @@ gh-wait commit <sha> -R owner/repo     # 等一個 commit 的所有 checks（run
 - `--ignore <glob>` 可重複：符合的 check 不等、失敗也不算。非忽略的都完成、只剩被忽略的還在跑時，再等 30 秒（`GH_WAIT_GRACE`）看有沒有新 check 出現，沒有就收工。
 - `--workflow` 會等所有符合的 run（同一個 commit 可能同時有 push 與 pull_request 兩個 run），全部成功才回 0；第一個跑完後會再列一次，之後才出現的 run 不追。
 
-- 一律放背景（`run_in_background`）。前景會被 Bash 工具的 10 分鐘上限砍掉，`timeout` 設再大也一樣；不要接 `| tail`：它的輸出本來就短，背景任務結束時回報的就是 gh-wait 的結束碼；接了 pipe 就變成 tail 的，而 macOS 上 agent 的 shell 是 zsh，沒有 `PIPESTATUS` 可以補救。
+- 一律放背景（`run_in_background`）。前景會被 Bash 工具的 10 分鐘上限砍掉，`timeout` 設再大也一樣；不要接 `| tail`：它的輸出本來就短，背景任務結束時回報的就是 gh-wait 的結束碼；接了 pipe 就變成 tail 的，而 macOS 上 agent 的 shell 是 zsh，沒有 `PIPESTATUS` 可以補救。也不要在後面加 `; echo $?`、`echo rc=$?`：結束碼會變成 echo 的 0，失敗被藏起來；gh-wait 自己會印結果，通知帶的就是真的結束碼。
 - 等通知就好：通知來之前不讀它的輸出檔、不 `pgrep`、不另外跑 `gh run view`／`gh pr checks`，那些都是在它旁邊再打一次 API。
 - push 完馬上等 PR：GitHub 可能還回報舊的 head commit，它的 checks 早就跑完了，會讀到舊結果。在 PR 分支的 checkout 裡跑，分支有 upstream 或 pushRemote 指向 PR 的 head repo（`git push -u` 過），且 HEAD 已經 push 時，`gh-wait pr` 會自己等 PR head 變成 HEAD，最多 2 分鐘，等不到（例如 PR 已被 Update branch 推得更新）就改看 PR 當下的 head，並在 stderr 註明。其他情況（不在那個 checkout、push 時沒加 `-u`）帶 `--sha <剛推的 commit>`，它會一直等到 PR head 變成那個 commit 或逾時。不要用 `sleep` 墊時間。
 

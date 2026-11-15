@@ -224,7 +224,9 @@ DENY:gh-wait run <run-id>|while true; do gh api "/repos/$O/$R/actions/runs/$ID";
 DENY:不帶參數|watch -n 5 "gh api repos/o/r/actions/runs/1 -q .status"
 DENY:gh-wait commit <sha> -R owner/repo|while true; do gh issue list; sleep 5; done
 DENY:推 tag 等 release 務必加 `--workflow <檔名>`|while true; do gh issue list; sleep 5; done
-DENY:不帶參數|curl -s https://api.github.com/repos/a/b/releases/latest
+DENY:改用 `gh api <path>`（走帳號的 5000 次）。|curl -s https://api.github.com/repos/a/b/releases/latest
+DENY:不帶參數|curl -s https://api.github.com/repos/a/b/actions/runs?head_sha=abc
+DENY:不帶參數|curl -s https://api.github.com/repos/a/b/commits/abc/check-runs
 DENY:gh-wait run 123 -R a/b|ssh ubuntu 'gh run watch 123 -R a/b'
 DENY:gh-wait run 99 -R o/r|bash -c 'while true; do gh run view 99 -R o/r; sleep 5; done'
 DENY:gh pr merge --auto|m(){ for t in 1 2 3; do gh pr view 5 --json mergeable; sleep 5; done; }; m

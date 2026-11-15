@@ -64,6 +64,7 @@ UNIT = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
 # still belongs to that curl.
 ARGS = r'(?:[^;&|\n\\]|\\[\s\S])*'
 ANON_CURL = re.compile(POS + r'(?P<cmd>curl|wget)\b' + ARGS + r'(?i:api\.github\.com)(?!/rate_limit\b)' + ARGS)
+CI_PATH = re.compile(r'/(?:actions/|check-runs|check-suites|statuses?\b|commits/[^/\s]+/(?:status|check)|pulls/\d+/?(?:[\s"\']|$))')
 AUTH = re.compile(r'(?i)authorization:|\$\(gh auth token\)|\$\{?(?:GITHUB_TOKEN|GH_TOKEN)\b')
 # Wrappers whose quoted argument is itself a command line (sh -c, ssh host, eval): their
 # loops are hidden from loops(), so reason() runs again on the unquoted argument. Group w
@@ -393,9 +394,12 @@ def judge(cmd, depth=0):
     if m:
         h = _hint_for_call(cmd[m.start('gh'):_cmd_end(cmd, mask, m.start('gh'), len(cmd))]) or HINT
         return '`gh pr checks --watch` 是固定間隔輪詢，會吃光共用的 5000/hr GitHub 額度。', h
-    if any(mask[m.start('cmd')] == CODE and not AUTH.search(m.group(0)) for m in ANON_CURL.finditer(cmd)):
+    anon = [m for m in ANON_CURL.finditer(cmd) if mask[m.start('cmd')] == CODE and not AUTH.search(m.group(0))]
+    if anon:
+        # the gh-wait hint only when the curl reads CI state; a release or file lookup gets the gh api advice alone
+        ci = any(CI_PATH.search(m.group(0)) for m in anon)
         return ('沒帶 token 的 curl／wget 打 api.github.com，吃的是出口 IP 共用的每小時 60 次匿名額度；'
-                '改用 `gh api <path>`（走帳號的 5000 次）。'), HINT
+                '改用 `gh api <path>`（走帳號的 5000 次）。'), HINT if ci else ''
     if match(WATCH_CMD, lambda m: m.start('cmd')):
         return '`watch … gh` 會每隔幾秒重跑 gh，會吃光共用的 5000/hr GitHub 額度。', HINT
     for kind, start, end in loops(cmd):
