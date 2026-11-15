@@ -14,12 +14,29 @@ REAL_LOG="$REAL_HOME/.local/state/gh-quota/gh-trace.log"
 real_lines_before=0
 [ -f "$REAL_LOG" ] && real_lines_before=$(wc -l < "$REAL_LOG" | tr -d ' ')
 
-PY3=$(command -v python3 2>/dev/null || true)
-# Strip /opt/homebrew/bin and /usr/local/bin so real brew/gh are never touched.
-mkdir -p "$T/home" "$T/stubs" "$T/bin" "$T/real" "$T/rec" "$T/evilbin"
+mkdir -p "$T/home" "$T/sysbin" "$T/stubs" "$T/bin" "$T/real" "$T/rec" "$T/evilbin"
+for tool in sh bash cat cp mv ln rm mkdir rmdir chmod stat date ps sed awk tr cut grep \
+            sort uniq head tail wc sleep python3 perl uname id readlink dirname \
+            basename mktemp env kill pgrep cmp dd ls hostname; do
+    tp=$(type -P "$tool" 2>/dev/null || true)
+    [ -n "$tp" ] && [ -x "$tp" ] && ln -sf "$tp" "$T/sysbin/$tool"
+done
+PY3=''
+[ -x "$T/sysbin/python3" ] && PY3="$T/sysbin/python3"
+
 export HOME="$T/home"
 export GH_TRACE_LOG="$T/default-trace.log"
-export PATH="$T/stubs:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$T/stubs:$T/bin:$T/sysbin"
+
+for cmd in gh brew; do
+    resolved=$(command -v "$cmd" 2>/dev/null || true)
+    case $resolved in
+        ""|"$T"/*) ;;
+        *)
+            printf 'FAIL hermetic PATH guard: %s resolved outside temp dir: %s\n' "$cmd" "$resolved"
+            exit 1 ;;
+    esac
+done
 
 fail=0
 REC=$T/rec
@@ -501,7 +518,7 @@ BREW_ARGV_LOG=$T/brew_argv
 BLOG=$T/logs_perm/brew.log
 
 # 15. brew install unlinks gh, installs POSIX /bin/sh shim pointing to opt/gh/bin/gh, verifies
-out=$(PATH="$BP/bin:$PATH" FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG "$GT" install 2>&1); rc=$?
+out=$(FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG "$GT" install "$BP/bin/gh" 2>&1); rc=$?
 if [ "$rc" -eq 0 ] \
     && [ -f "$BP/bin/gh" ] && [ ! -L "$BP/bin/gh" ] && [ ! -e "$BP/bin/gh.real" ] \
     && head -n 1 "$BP/bin/gh" | grep -q '^#!/bin/sh$' \
@@ -530,7 +547,7 @@ ln -s "../Cellar/gh/2.66.0" "$BP/opt/gh"
 rm -rf "$BP/Cellar/gh/2.65.0"
 
 ver=$(REC=$REC GH_TRACE_LOG=$BLOG "$BP/bin/gh" --version); rc=$?
-st=$(PATH="$BP/bin:$PATH" FAKE_BREW_PREFIX=$BP GH_TRACE_LOG=$BLOG "$GT" status 2>&1); st_rc=$?
+st=$(FAKE_BREW_PREFIX=$BP GH_TRACE_LOG=$BLOG "$GT" status "$BP/bin/gh" 2>&1); st_rc=$?
 if [ "$rc" -eq 0 ] && [ "$ver" = "gh version 2.66.0 (fake)" ] \
     && [ "$st_rc" -eq 0 ] \
     && grep -q "shim: installed at $BP/bin/gh (homebrew)" <<<"$st" \
@@ -543,7 +560,7 @@ fi
 
 # 18. T3 uninstall failure when brew link fails: restores shim, never leaves gh missing
 : > "$BREW_ARGV_LOG"
-out=$(PATH="$BP/bin:$PATH" FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG BREW_FAIL_LINK=1 "$GT" uninstall 2>&1); rc=$?
+out=$(FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG BREW_FAIL_LINK=1 "$GT" uninstall "$BP/bin/gh" 2>&1); rc=$?
 ver=$("$BP/bin/gh" --version 2>/dev/null)
 if [ "$rc" -ne 0 ] && [ -f "$BP/bin/gh" ] \
     && [ "$ver" = "gh version 2.66.0 (fake)" ] \
@@ -555,7 +572,7 @@ fi
 
 # 19. T3 brew uninstall succeeds and restores Cellar symlink; re-run is idempotent
 : > "$BREW_ARGV_LOG"
-out=$(PATH="$BP/bin:$PATH" FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG "$GT" uninstall 2>&1); rc=$?
+out=$(FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG "$GT" uninstall "$BP/bin/gh" 2>&1); rc=$?
 if [ "$rc" -eq 0 ] && [ -L "$BP/bin/gh" ] \
     && [ "$(readlink "$BP/bin/gh")" = "../Cellar/gh/2.66.0/bin/gh" ] \
     && grep -q '^link gh$' "$BREW_ARGV_LOG" \
@@ -566,7 +583,7 @@ else
 fi
 
 : > "$BREW_ARGV_LOG"
-out=$(PATH="$BP/bin:$PATH" FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG "$GT" uninstall 2>&1); rc=$?
+out=$(FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG "$GT" uninstall "$BP/bin/gh" 2>&1); rc=$?
 if [ "$rc" -eq 0 ] && [ -L "$BP/bin/gh" ] && [ ! -s "$BREW_ARGV_LOG" ]; then
     pass "brew uninstall is idempotent when gh is linked"
 else
@@ -575,13 +592,13 @@ fi
 
 # 19b. T3 re-run when gh is absent and brew keg is unlinked: detects & links gh (and fails if missing)
 rm -f "$BP/bin/gh"
-out=$(PATH="$BP/bin:$PATH" FAKE_BREW_PREFIX=$BP BREW_FAIL_LINK=1 "$GT" uninstall 2>&1); rc=$?
+out=$(FAKE_BREW_PREFIX=$BP BREW_FAIL_LINK=1 "$GT" uninstall "$BP/bin/gh" 2>&1); rc=$?
 if [ "$rc" -ne 0 ] && grep -qi 'unlinked' <<<"$out"; then
     pass "T3 uninstall fails loudly when gh is absent and brew link fails"
 else
     nope "T3 uninstall fails loudly when gh is absent and brew link fails" "rc=$rc out=$out"
 fi
-out=$(PATH="$BP/bin:$PATH" FAKE_BREW_PREFIX=$BP "$GT" uninstall 2>&1); rc=$?
+out=$(FAKE_BREW_PREFIX=$BP "$GT" uninstall "$BP/bin/gh" 2>&1); rc=$?
 if [ "$rc" -eq 0 ] && [ -L "$BP/bin/gh" ]; then
     pass "T3 uninstall recovers absent unlinked brew gh via brew link gh"
 else
@@ -604,7 +621,7 @@ exit 1
 EOF
 chmod +x "$BP/Cellar/gh/2.66.0/bin/gh"
 : > "$BREW_ARGV_LOG"
-PATH="$BP/bin:$PATH" FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG "$GT" install >"$T/stdout" 2>"$T/stderr"; rc=$?
+FAKE_BREW_PREFIX=$BP BREW_ARGV_LOG=$BREW_ARGV_LOG "$GT" install "$BP/bin/gh" >"$T/stdout" 2>"$T/stderr"; rc=$?
 if [ "$rc" -ne 0 ] && [ -L "$BP/bin/gh" ] \
     && [ "$(readlink "$BP/bin/gh")" = "../Cellar/gh/2.66.0/bin/gh" ] \
     && grep -q '^link gh$' "$BREW_ARGV_LOG"; then
