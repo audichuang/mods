@@ -9,8 +9,9 @@
  *
  *   - `turn.step` reads each main-loop request's usage (subagents have their
  *     own prefixes and are left out)
- *   - `$.clock.every(1000)` redraws the countdown, and only while its text
- *     changes: an idle, expired session costs nothing
+ *   - `$.clock.every(1000)` ticks the countdown; the band is redrawn every 5 s
+ *     (usage and git re-read) and when the model or the countdown text changes.
+ *     A `-p` run or an SDK session with no surface skips all of it
  *   - a row above the prompt (the AbovePrompt component), an optional status
  *     line entry, and `/cache`, a pane with one row per turn
  *
@@ -112,6 +113,8 @@ const GH_PATHS = ['gh', '/opt/homebrew/bin/gh', '/home/linuxbrew/.linuxbrew/bin/
 const HUD_LOG = '.local/state/prompt-glance/hud.log'
 const HUD_LOG_MAX = 500
 let lastNote = ''
+// false for a `-p` run or an SDK session with no surface yet: nothing to draw, so no git, timer work or log lines
+let drawing = true
 // a plan window's reset time shows only from here up
 const LOUD = 50
 // cells between the band's parts: room to breathe
@@ -181,6 +184,7 @@ let conv = startConversation()
  * time, so a slow or locked repo holds back neither a hook nor the other figures.
  */
 async function rereadAndRedraw($: EngineInterface, gitNow = false): Promise<void> {
+  if (!drawing) return
   readGitStatus($, gitNow)
   await readUsageFigures($)
   model = prettyModel(await $.session.model().catch(() => model))
@@ -279,14 +283,21 @@ async function readGhQuota($: EngineInterface) {
   }
 }
 
+// hud.log writes, one after another: two overlapping read-then-write rounds leave a torn line
+let noting: Promise<void> = Promise.resolve()
+
 /** Appends `event` to hud.log when it differs from the last line written; never throws. */
-async function note($: EngineInterface, event: string) {
-  if (event === lastNote || home === undefined) return
+function note($: EngineInterface, event: string): Promise<void> {
+  if (event === lastNote || home === undefined) return noting
   lastNote = event
   const path = `${home}/${HUD_LOG}`
-  const before = await $.fs.read(path).catch(() => '')
-  const kept = [...before.split('\n').filter(l => l !== ''), `${new Date().toISOString()}\t${event}`].slice(-HUD_LOG_MAX)
-  await $.fs.write(path, kept.join('\n') + '\n').catch(() => undefined)
+  const line = `${new Date().toISOString()}\t${event}`
+  noting = noting.then(async () => {
+    const before = await $.fs.read(path).catch(() => '')
+    const kept = [...before.split('\n').filter(l => l !== ''), line].slice(-HUD_LOG_MAX)
+    await $.fs.write(path, kept.join('\n') + '\n').catch(() => undefined)
+  })
+  return noting
 }
 
 type Policy = { warnMs: number; compactAtTokens: number }
@@ -574,14 +585,20 @@ export const register: Register = (on, options) => {
 
     cwd = e.cwd
     home = await $.env.get('HOME').catch(() => undefined)
+    drawing = e.isInteractive || e.surface !== null
     // the account (and with it the lifetime) is known once the first reading lands
     void rereadAndRedraw($, true).then(() => $.ui.log(`prompt-glance loaded: ${conv.ttl} cache (${conv.ttlSource}), /${COMMAND} opens the table`, { to: 'debug' }))
-    void note($, `start ${e.isInteractive ? 'interactive' : 'headless'} ${below ? 'below' : 'above'}`)
+    if (drawing) void note($, `start ${e.isInteractive ? 'interactive' : 'headless'} ${below ? 'below' : 'above'}`)
     if (e.isInteractive) void readGhQuota($).then(() => $.ui.invalidate('ui.render'))
 
     let ticks = 0
     timer?.cancel()
     timer = $.clock.every(1000, () => {
+      // an SDK session may gain a surface later: look once a second, do nothing else until then
+      if (!drawing) {
+        void $.session.surfaces().then(s => { drawing = s.length > 0 }).catch(() => undefined)
+        return
+      }
       if (e.isInteractive && ticks % GH_EVERY_TICKS === GH_EVERY_TICKS - 1) void readGhQuota($).then(() => $.ui.invalidate('ui.render'))
       if (++ticks % 5 === 0) void rereadAndRedraw($)
       // the model every second: a /model switch shows at once, not on the next request
@@ -623,7 +640,7 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', async ($, e, next) => {
-    void note($, `end ${e.reason}`)
+    if (drawing) void note($, `end ${e.reason}`)
     // /clear and a resume carry on in this process with another conversation, and another cache: start over, and
     // keep the clock (no session.start follows). An exit, a logout or the end of a -p run takes the clock with the process.
     const processGoesOn = e.reason !== 'prompt_input_exit' && e.reason !== 'logout' && e.reason !== 'other'
@@ -641,7 +658,7 @@ export const register: Register = (on, options) => {
   // a new turn: remember where cost and the plan windows stand, so the HUD can show what this turn spends
   on('turn.start', async ($, e, next) => {
     // a subagent's turn runs inside the main one, whose baseline stays
-    if (e.agentId !== undefined) return next(e)
+    if (e.agentId !== undefined || !drawing) return next(e)
     // a reading taken now, not the cached one: that may predate the last turn's spending or a /clear.
     // Only the engine's usage call is awaited; git stays in the background
     await readUsageFigures($)

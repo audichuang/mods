@@ -1308,3 +1308,53 @@ describe('the promptCacheTtl setting', () => {
     expect(calls.logs.join('\n')).toContain('1h cache (Claude subscription default)')
   })
 })
+
+describe('hud.log and headless runs', () => {
+  // no timers in the test runtime: let queued promise chains run out
+  const settle = async () => { for (let i = 0; i < 50; i++) await Promise.resolve() }
+
+  function fakeFs(on: On) {
+    const files = new Map<string, string>()
+    on('fs.read', async ($, e) => {
+      const v = files.get((e as { path: string }).path)
+      if (v === undefined) return { value: '' } as never
+      // a slow disk: lets two writers overlap if nothing orders them
+      await Promise.resolve()
+      return { value: v } as never
+    })
+    on('fs.write', async ($, e) => {
+      const { path, text } = e as { path: string; text: string }
+      files.set(path, text)
+      return { value: undefined } as never
+    })
+    return files
+  }
+
+  test('lines written back to back all land whole', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, { HOME: '/h' }, calls)
+    const files = fakeFs(on)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await $.session.end({ reason: 'clear' } as never)
+    await step($)
+    await settle()
+    const log = [...files.entries()].find(([p]) => p.endsWith('hud.log'))?.[1] ?? ''
+    const lines = log.split('\n').filter(Boolean)
+    expect(lines.some(l => /\tstart interactive /.test(l))).toBe(true)
+    expect(lines.some(l => /\tend clear$/.test(l))).toBe(true)
+    for (const l of lines) expect(l).toMatch(/^\d{4}-\d\d-\d\dT[\d:.]+Z\t\S/)
+  })
+
+  test('a -p run draws nowhere: no git status, no hud.log line', async ($, on) => {
+    const calls: Calls = { status: [], logs: [] }
+    fakeEngine(on, { HOME: '/h' }, calls)
+    const files = fakeFs(on)
+    await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
+    await $.turn.start({ turnId: 't1' } as never)
+    await step($)
+    await $.session.end({ reason: 'other' } as never)
+    await settle()
+    expect(argvs.filter(a => a.includes('status'))).toEqual([])
+    expect([...files.keys()].filter(p => p.endsWith('hud.log'))).toEqual([])
+  })
+})
