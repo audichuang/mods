@@ -12,6 +12,9 @@ const GH = ['gh', '/opt/homebrew/bin/gh', '/home/linuxbrew/.linuxbrew/bin/gh', '
 const LOG_DIR = '.local/state/gh-quota'
 const LOG_MAX = 500
 
+// One log line per event: gh's multi-line errors collapse to one line, capped.
+const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 200)
+
 type Kind = 'ok' | 'anon' | 'no-gh' | 'timeout' | 'fail' | 'bad-output'
 
 export const register: Register = (on, options) => {
@@ -66,16 +69,16 @@ export const register: Register = (on, options) => {
       }
       // gh exits 4 when it has no credentials at all, without asking GitHub.
       if (ran.exitCode === 4) {
-        return { kind: 'anon', text: 'GH 未登入 · gh auth login', detail: `exit 4: ${ran.stderr.trim().slice(0, 200)}` }
+        return { kind: 'anon', text: 'GH 未登入 · gh auth login', detail: `exit 4: ${oneLine(ran.stderr)}` }
       }
       if (ran.exitCode !== 0) {
-        return { kind: 'fail', text: 'GH 額度：查詢失敗', detail: `exit ${ran.exitCode}: ${ran.stderr.trim().slice(0, 200)}` }
+        return { kind: 'fail', text: 'GH 額度：查詢失敗', detail: `exit ${ran.exitCode}: ${oneLine(ran.stderr)}` }
       }
       // Number('') is 0, so reject empty fields before converting.
       const fields = ran.stdout.trim().split('\t')
       const [remaining, limit, reset, graphql] = fields.map(Number)
       if (fields.length !== 4 || fields.includes('') || remaining === undefined || limit === undefined || reset === undefined || graphql === undefined || [remaining, limit, reset, graphql].some(Number.isNaN)) {
-        return { kind: 'bad-output', text: 'GH 額度：回應格式不對', detail: ran.stdout.trim().slice(0, 200) }
+        return { kind: 'bad-output', text: 'GH 額度：回應格式不對', detail: oneLine(ran.stdout) }
       }
       const resetAt = new Date(reset * 1000).toTimeString().slice(0, 5)
       // The account's quota isn't this one, so say not logged in instead of warning about it.

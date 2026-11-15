@@ -159,6 +159,15 @@ test('a failed call (exit 1, HTTP 401) is fail with its stderr', { options: { st
   expect(calls.status.at(-1)).toBe('GH 額度：查詢失敗')
 })
 
+test('a multi-line error stays on one log line', async ($, on) => {
+  const stderr = 'error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com\n'
+  const { files } = engine(on, { exitCode: 1, stdout: '', stderr })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as any)
+  await settle(() => kinds(files[FILE]).length >= 2)
+  expect(files[FILE]).toContain('\tfail\texit 1: error connecting to api.github.com check your internet connection or https://githubstatus.com\n')
+  for (const l of files[FILE]!.split('\n').filter(Boolean)) expect(l).toMatch(/^\d{4}-\d\d-\d\dT/)
+})
+
 for (const stdout of ['', '1\t2\t3', '\t5000\t1\t1', 'x\t5000\t1\t1']) {
   test(`bad output ${JSON.stringify(stdout)}: bad-output, no toast`, { options: { status: true } }, async ($, on) => {
     const { files, calls } = engine(on, { exitCode: 0, stdout })
