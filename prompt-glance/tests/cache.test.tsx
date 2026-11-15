@@ -1317,42 +1317,28 @@ describe('hud.log and headless runs', () => {
   // no timers in the test runtime: let queued promise chains run out
   const settle = async () => { for (let i = 0; i < 50; i++) await Promise.resolve() }
 
-  function fakeFs(on: On) {
-    const files = new Map<string, string>()
-    on('fs.read', async ($, e) => {
-      const v = files.get((e as { path: string }).path)
-      if (v === undefined) return { value: '' } as never
-      // a slow disk: lets two writers overlap if nothing orders them
-      await Promise.resolve()
-      return { value: v } as never
-    })
-    on('fs.write', async ($, e) => {
-      const { path, text } = e as { path: string; text: string }
-      files.set(path, text)
-      return { value: undefined } as never
-    })
-    return files
-  }
+  // the engine runs no shell here: each append is a `/bin/sh -c <script> sh <path> <line> …` call
+  const appended = () => argvs.filter(a => a[0] === '/bin/sh' && a[4]?.endsWith('/hud.log'))
+  const hudLines = () => appended().map(a => a[5] ?? '')
 
-  test('lines written back to back all land whole', async ($, on) => {
+  test('each line is appended whole, in order, to the shared log', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { HOME: '/h' }, calls)
-    const files = fakeFs(on)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
     await $.session.end({ reason: 'clear' } as never)
     await step($)
     await settle()
-    const log = [...files.entries()].find(([p]) => p.endsWith('hud.log'))?.[1] ?? ''
-    const lines = log.split('\n').filter(Boolean)
+    const lines = hudLines()
+    expect(appended().every(a => a[4] === '/h/.local/state/prompt-glance/hud.log' && a[6] === '500' && a[7] === '600')).toBe(true)
     expect(lines.some(l => /\tstart interactive /.test(l))).toBe(true)
     expect(lines.some(l => /\tend clear$/.test(l))).toBe(true)
     for (const l of lines) expect(l).toMatch(/^\d{4}-\d\d-\d\dT[\d:.]+Z\t\S/)
+    expect(lines.findIndex(l => /\tstart /.test(l))).toBeLessThan(lines.findIndex(l => /\tend clear$/.test(l)))
   })
 
   test('a -p run draws nowhere: no git status, no hud.log line', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { HOME: '/h' }, calls)
-    const files = fakeFs(on)
     await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
     await $.turn.start({ turnId: 't1' } as never)
     await step($)
@@ -1360,7 +1346,7 @@ describe('hud.log and headless runs', () => {
     await settle()
     expect(argvs.filter(a => a.includes('status'))).toEqual([])
     expect(usageReads).toBe(0)
-    expect([...files.keys()].filter(p => p.endsWith('hud.log'))).toEqual([])
+    expect(appended()).toEqual([])
   })
 
   test('an SDK session that gains a surface starts drawing', async ($, on) => {
@@ -1380,11 +1366,9 @@ describe('hud.log and headless runs', () => {
   test('an error with line breaks stays on one hud.log line', async ($, on) => {
     const calls: Calls = { status: [], logs: [] }
     fakeEngine(on, { HOME: '/h' }, calls)
-    const files = fakeFs(on)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
     await $.session.end({ reason: 'a\nb' } as never)
     await settle()
-    const log = [...files.entries()].find(([p]) => p.endsWith('hud.log'))?.[1] ?? ''
-    expect(log).toContain('\tend a b\n')
+    expect(hudLines().some(l => /\tend a b$/.test(l))).toBe(true)
   })
 })

@@ -109,7 +109,7 @@ const GH_EVERY_TICKS = 120
 const GH_JQ = '[.resources.core.remaining, .resources.core.limit, .resources.core.reset] | @tsv'
 // $.process.run takes no shell, and the Claude process's PATH may lack Homebrew's bin
 const GH_PATHS = ['gh', '/opt/homebrew/bin/gh', '/home/linuxbrew/.linuxbrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'] as const
-// one line per change of why the HUD is or isn't drawn, newest HUD_LOG_MAX kept
+// one line per change of why the HUD is or isn't drawn, newest HUD_LOG_MAX kept (trimmed in note)
 const HUD_LOG = '.local/state/prompt-glance/hud.log'
 const HUD_LOG_MAX = 500
 let lastNote = ''
@@ -283,7 +283,21 @@ async function readGhQuota($: EngineInterface) {
   }
 }
 
-// hud.log writes, one after another: two overlapping read-then-write rounds leave a torn line
+// hud.log is shared by every session on the machine, and $.fs.write replaces the whole file:
+// two sessions' read-then-write rounds overlapped and left torn lines and NUL runs. The OS's
+// O_APPEND (`>>`) lands each short line whole whatever the other writers do. Past the cap plus
+// HUD_LOG_SLACK the newest HUD_LOG_MAX lines are copied to a temp file renamed over the log;
+// a line another session appends between the copy and the rename is lost, never torn.
+// $1 log path, $2 line, $3 lines to keep, $4 trim threshold
+const APPEND_SH = [
+  'd=${1%/*}; [ -d "$d" ] || mkdir -p "$d" || exit 1',
+  'printf \'%s\\n\' "$2" >> "$1" || exit 1',
+  'n=$(wc -l < "$1")',
+  'if [ "$n" -gt "$4" ]; then t="$1.$$"; tail -n "$3" "$1" > "$t" && mv -f "$t" "$1"; fi',
+].join('\n')
+const HUD_LOG_SLACK = 100
+
+// this session's lines in the order they were noted: each append is its own process
 let noting: Promise<void> = Promise.resolve()
 
 /** Appends `event` to hud.log when it differs from the last line written; never throws. */
@@ -294,10 +308,11 @@ function note($: EngineInterface, event: string): Promise<void> {
   lastNote = event
   const path = `${home}/${HUD_LOG}`
   const line = `${new Date().toISOString()}\t${event}`
+  const argv = ['/bin/sh', '-c', APPEND_SH, 'sh', path, line, String(HUD_LOG_MAX), String(HUD_LOG_MAX + HUD_LOG_SLACK)]
+  // cwd HOME: the session's cwd can be a removed worktree, where nothing starts
+  const cwd = home
   noting = noting.then(async () => {
-    const before = await $.fs.read(path).catch(() => '')
-    const kept = [...before.split('\n').filter(l => l !== ''), line].slice(-HUD_LOG_MAX)
-    await $.fs.write(path, kept.join('\n') + '\n').catch(() => undefined)
+    await $.process.run(argv, { cwd, timeoutMs: 5_000 }).catch(() => undefined)
   })
   return noting
 }
