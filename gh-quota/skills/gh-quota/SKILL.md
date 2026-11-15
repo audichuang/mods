@@ -9,20 +9,35 @@ description: 等 GitHub Actions／CI 跑完、等 PR checks、checks 過了再�
 
 ## 等 CI 跑完
 
-用 `gh-wait`，放背景跑，結束時會通知，不要另外輪詢它：
+push 完，在那個 checkout 直接跑 `gh-wait`，不帶參數，放背景，結束時會通知。不要先 `sleep` 再 `gh run list` 找 run id：
+
+```bash
+gh-wait                                # 剛 push 的 HEAD：有 open PR 就等 PR，沒有（push 到 main、tag）就等這個 commit
+gh-wait -C ../other-worktree           # checkout 在別的目錄
+gh-wait --workflow release.yml         # 只等某個 workflow 的 run（tag push 觸發的 release 也適用）
+gh-wait --ignore 'windows-*'           # 已知會掛或卡住的 check 不算數
+```
+
+已經知道目標時：
 
 ```bash
 gh-wait run <run-id> -R owner/repo     # 等一個 workflow run
 gh-wait pr <number> -R owner/repo      # 等 PR head commit 的所有 checks
-gh-wait commit <sha> -R owner/repo     # 等一個 commit 的所有 checks（沒有 PR 的 push，run 還沒建出來也會等）
+gh-wait commit <sha> -R owner/repo     # 等一個 commit 的所有 checks（run 還沒建出來也會等；短 sha 可以）
 ```
+
+- 不帶參數時，它從 push 的 remote 判斷 repo：先找 push repo 上這個分支的 open PR，fork 上沒有就去上游（parent）找；HEAD 還沒 push 會直接結束（結束碼 2），請先 push。只認 github.com 的 remote（SSH 別名用本機 `ssh -G` 確認），其他 remote 退回 `gh repo view`。stderr 第一行寫它選了哪個目標。
+- tag push 觸發的 release 一定要加 `--workflow <檔名>`：不帶的話，main 那次 push 的 CI 已經全綠、release 的 run 還沒建出來時會直接回 0。
+- 跑的時候狀態有變化就印一行進度（run 與 `--workflow` 是 `jobs 3/7 done, running: …`，pr／commit 是 `wait:N running (…)`）；結束時印 run 或失敗 check 的 URL，失敗時附上最多 3 個失敗 job 的 log 尾巴（`--log-lines N`，預設 40，0 關掉）。不用另外抓 log 或查 jobs。
+- `--ignore <glob>` 可重複：符合的 check 不等、失敗也不算。非忽略的都完成、只剩被忽略的還在跑時，再等 30 秒（`GH_WAIT_GRACE`）看有沒有新 check 出現，沒有就收工。
+- `--workflow` 會等所有符合的 run（同一個 commit 可能同時有 push 與 pull_request 兩個 run），全部成功才回 0；第一個跑完後會再列一次，之後才出現的 run 不追。
 
 - 一律放背景（`run_in_background`）。前景會被 Bash 工具的 10 分鐘上限砍掉，`timeout` 設再大也一樣；接 `| tail` 時 `$?` 是 tail 的，真正的結束碼要看 `${PIPESTATUS[0]}`。
 - 等通知就好：通知來之前不讀它的輸出檔、不 `pgrep`、不另外跑 `gh run view`／`gh pr checks`，那些都是在它旁邊再打一次 API。
 - push 完馬上等 PR：GitHub 可能還回報舊的 head commit，它的 checks 早就跑完了，會讀到舊結果。在 PR 分支的 checkout 裡跑，分支有 upstream 或 pushRemote 指向 PR 的 head repo（`git push -u` 過），且 HEAD 已經 push 時，`gh-wait pr` 會自己等 PR head 變成 HEAD，最多 2 分鐘，等不到（例如 PR 已被 Update branch 推得更新）就改看 PR 當下的 head，並在 stderr 註明。其他情況（不在那個 checkout、push 時沒加 `-u`）帶 `--sha <剛推的 commit>`，它會一直等到 PR head 變成那個 commit 或逾時。不要用 `sleep` 墊時間。
 
 - 結束碼：0 成功、1 失敗（`pr` 印出失敗的 check，`run` 印出失敗的 job）、2 參數錯誤、API 錯誤或逾時（stderr 會寫是哪一種，並附上 gh 自己的錯誤訊息）。
-- 選項：`-i` 輪詢秒數（預設 15）、`-t` 逾時分鐘（預設 120）、`--sha`（只有 `pr`：先等 PR head 變成這個 commit，可給短 sha）。
+- 選項：`-i` 輪詢秒數（預設 15）、`-t` 逾時分鐘（預設 120）、`--sha`（只有 `pr`：先等 PR head 變成這個 commit，可給短 sha）、`-C`、`--workflow`、`--ignore`、`--log-lines`（見上）。
 - 需要 `gh` 和 `jq`；沒有 jq 會立刻說明並結束。
 - gh 沒登入會立刻結束（結束碼 2）；網路錯誤或 5xx 會重試，連續 5 次才放棄；額度用完（403／429 且剩 0）會等到重置時間再繼續，不算錯誤（一開始讀 PR head 那次也一樣）。
 - 它帶 ETag 做條件請求，狀態沒變時 GitHub 回 304，不扣額度；只有狀態真的變了才算一次。
@@ -41,7 +56,7 @@ gh-wait commit <sha> -R owner/repo     # 等一個 commit 的所有 checks（沒
 - `watch … gh`。
 - 沒帶 token 的 `curl`／`wget` 打 `api.github.com`：吃的是出口 IP 共用的每小時 60 次匿名額度，改用 `gh api`。token（`Authorization:` header、`$GH_TOKEN`、`$(gh auth token)`）要寫在同一個 curl 指令裡才算。
 
-這些會被 plugin 的 hook 擋下，包括寫在 `-R owner/repo` 後面、包在 `bash -c '…'`／`sh -c`／`ssh host '…'`／`eval '…'` 裡的（遠端沒有 hook）。
+這些會被 plugin 的 hook 擋下，包括寫在 `-R owner/repo` 後面、包在 `bash -c '…'`／`sh -c`／`ssh host '…'`／`eval '…'`、函式或 `{ …; }` 裡的（遠端沒有 hook）。擋下時訊息會依你在輪詢的東西給出該換成的 gh-wait 指令。
 
 ## 查額度
 
@@ -51,8 +66,9 @@ gh-wait commit <sha> -R owner/repo     # 等一個 commit 的所有 checks（沒
 
 各台記各自的，放在 `~/.local/state/gh-quota/`：
 
-- `hook.log`：hook 每擋一次寫一行 JSON（ts、host、session、cwd、reason、cmd）。看誤擋或常犯的寫法：`tail -n 50 ~/.local/state/gh-quota/hook.log | jq -c '{ts,reason,cmd}'`，按原因統計：`jq -r .reason ~/.local/state/gh-quota/hook.log | sort | uniq -c | sort -rn`。超過 1 MB 輪替成 `hook.log.1`。
+- `hook.log`：hook 每擋一次寫一行 JSON（ts、host、session、cwd、reason、cmd，cmd 最多 8000 字）。看誤擋或常犯的寫法：`tail -n 50 ~/.local/state/gh-quota/hook.log | jq -c '{ts,reason,cmd}'`，按原因統計：`jq -r .reason ~/.local/state/gh-quota/hook.log | sort | uniq -c | sort -rn`。超過 1 MB 輪替成 `hook.log.1`。
 - `meter.log`：狀態列 mod 的事件，tab 分隔（時間、事件、細節）。事件有 `start`（每個互動 session 開始記一次）、`warn`（額度偏低，每個重置週期一次），以及查詢結果 `ok`、`anon`（gh 沒登入，看到的是匿名額度）、`no-gh`、`timeout`、`fail`、`bad-output`（這六種只在類型改變時記）；保留最後 500 行。
 - ubuntu 另有 `~/.local/state/gh-rate.log`：每 5 分鐘整個帳號的用量，用來對時間找出是誰在燒額度。
+- `gh-trace.log`：裝了 `gh-trace` 時，每次 gh 呼叫一行（時間、host、pid、cwd、呼叫者鏈、argv；秘密已遮蔽）。它裝在系統 gh 的位置，所有呼叫者（Claude、Codex、桌面 app、腳本）都會經過，只記錄不攔。`gh-trace install` 安裝、`gh-trace status` 看狀態、`gh-trace report --window 5` 依時段列出前幾名呼叫者、`gh-trace uninstall` 移除；裝上去的 shim 是複製的檔案，改了 `gh-trace-shim.sh` 要先 uninstall 再 install 才會更新。Homebrew 的 gh 用 `brew unlink` 讓位（gh 的 man page 與 shell 補全會暫時不見，uninstall 時 `brew link` 回來），gh 本身照樣隨 `brew upgrade` 更新。記錄只有誰、什麼、何時，沒有耗時與結束碼。
 
 看到誤擋就把那條指令加進 `tests/hooktest.sh` 當 allow 案例再修 hook；看到漏擋就加 DENY 案例。gh-wait 的行為測在 `tests/gh-wait-test.sh`（假的 gh 放 PATH 最前面）。

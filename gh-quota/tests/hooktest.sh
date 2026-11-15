@@ -194,6 +194,57 @@ allow|for r in me/a me/b; do gh api "repos/$r/pulls" --jq '.[] | select(.draft);
 DENY:沒有 sleep|while true; do read x; gh api "$x"; done
 DENY|while true; do echo "$(gh run view 1 --json status)"; sleep 5; done
 DENY|while true; do ssh ubuntu "gh api x"; sleep 5; done
+DENY:gh-wait（不帶參數|for i in $(seq 30); do gh run list --commit $H --json databaseId; sleep 5; done
+DENY:gh-wait commit <sha> -R owner/repo|for i in $(seq 30); do gh run list --commit $H; sleep 5; done
+DENY:推 tag 等 release 務必加 `--workflow <檔名>`|for i in $(seq 30); do gh run list --commit $H; sleep 5; done
+DENY:gh-wait --workflow fork-release.yml|while true; do gh run list --workflow fork-release.yml --json status -q '.[] | select(.headBranch=="v0.1.33-fork.1")'; sleep 5; done
+DENY:gh-wait --workflow release.yml|while true; do gh run list -R o/r -w release.yml; sleep 5; done
+DENY:--workflow <檔名>|while true; do gh run list --workflow "$WF"; sleep 5; done
+DENY:--workflow <檔名>|until gh run list --branch v1.2.3 -R a/b --json status | grep -q completed; do sleep 10; done
+DENY:gh-wait commit <sha> -R a/b|until gh run list -R a/b --branch v1.2.3; do sleep 10; done
+DENY:放背景跑|for i in $(seq 10); do gh run list --commit $H; sleep 5; done
+DENY:gh-wait run 123 -R a/b|gh run watch 123 -R a/b
+DENY:gh-wait run <run-id> -R owner/repo|id=$(gh run list -L1 -q x); gh run watch $id --interval 30
+DENY:gh-wait run 456 -R o/r|while true; do gh --repo o/r run view 456 --json status; sleep 5; done
+DENY:gh-wait run <run-id> -R owner/repo|while true; do gh run view "$ID" --json status; sleep 5; done
+DENY:gh-wait run 789 -R owner/repo|gh run watch --interval 30 789
+DENY:gh-wait pr 12 -R owner/repo|cd repo && gh pr checks 12 --watch --interval 90
+DENY:gh-wait pr 5 -R o/r|while true; do gh -R o/r pr checks 5; sleep 5; done
+DENY:gh-wait pr 7 -R owner/repo|while true; do gh pr view 7 --json statusCheckRollup; sleep 5; done
+DENY:gh-wait pr <number> -R owner/repo|while true; do gh pr view "$PR" --json statusCheckRollup; sleep 5; done
+DENY:gh pr merge --auto|while ! gh pr view 3 --json state -q .state | grep -q MERGED; do sleep 20; done
+DENY:不等 PR|while true; do gh pr view 5 --json mergeable; sleep 5; done
+DENY:gh pr view 5 -R a/b|while true; do gh pr view 5 -R a/b --comments; sleep 5; done
+DENY:gh-wait run 1 -R o/r|for i in $(seq 7200); do gh api repos/o/r/actions/runs/1 > "status-$i.json"; sleep 0.1; done
+DENY:gh-wait run <run-id> -R o/r|while true; do gh api repos/o/r/actions/jobs/999; sleep 5; done
+DENY:gh-wait run <run-id> -R o/r|while true; do gh api repos/o/r/check-runs/999; sleep 5; done
+DENY:gh-wait run <run-id> -R o/r|while true; do gh api repos/o/r/check-suites/999; sleep 5; done
+DENY:gh-wait run 123 -R o/r|while true; do gh api repos/o/r/actions/runs/123/jobs; sleep 5; done
+DENY:gh-wait run <run-id>|while true; do gh api "/repos/$O/$R/actions/runs/$ID"; sleep 5; done
+DENY:不帶參數|watch -n 5 "gh api repos/o/r/actions/runs/1 -q .status"
+DENY:gh-wait commit <sha> -R owner/repo|while true; do gh issue list; sleep 5; done
+DENY:推 tag 等 release 務必加 `--workflow <檔名>`|while true; do gh issue list; sleep 5; done
+DENY:不帶參數|curl -s https://api.github.com/repos/a/b/releases/latest
+DENY:gh-wait run 123 -R a/b|ssh ubuntu 'gh run watch 123 -R a/b'
+DENY:gh-wait run 99 -R o/r|bash -c 'while true; do gh run view 99 -R o/r; sleep 5; done'
+DENY:gh pr merge --auto|m(){ for t in 1 2 3; do gh pr view 5 --json mergeable; sleep 5; done; }; m
+DENY|f() { while true; do gh run view 1; sleep 5; done; }; f
+DENY|{ until gh pr checks 5; do sleep 5; done; }
+DENY|while true; do { gh pr view 1; sleep 5; }; done
+DENY|{ gh run watch 1; }
+allow|echo ${x}; gh pr view 1
+allow|{ gh pr view 1; }
+allow|echo {a,b}; gh pr view 1
+allow|while true; do echo ${done:-1}; done
+allow|f(){ for r in a b; do gh repo clone me/$r; done; }; f
+allow|awk 'BEGIN { curl = "https://api.github.com/repos/a/b"; print curl }'
+allow|node -e 'const o = { curl: "https://api.github.com/x" }; console.log(o)'
+allow|jq -n '{ curl: "https://api.github.com" }'
+allow|echo "{ curl https://api.github.com/x }"
+allow|echo 'curl https://api.github.com/x'
+DENY|{ curl -s https://api.github.com/repos/a/b; } > out.json
+DENY|curl https://api.github.com/x
+allow|curl -H "Authorization: token $T" https://api.github.com/x
 CASES
 
 # Multi-line commands: backslash continuation keeps one curl; heredoc bodies are text, not commands.
@@ -205,6 +256,7 @@ run "git commit -F - heredoc quoting bash -c polling" allow 10 cmd $'git commit 
 run "bash heredoc script polling gh" DENY 10 cmd $'bash <<\'EOF\'\nwhile true; do gh api x; sleep 5; done\nEOF'
 # A heredoc fed to anything but a shell is text: a file's content, a script's data, a doc.
 run "python3 heredoc editing a doc that names the watch command" allow 10 cmd $'python3 - <<\'EOF\'\ns = open("MEMORY.md").read().replace("gh run watch 1", "gh-wait run 1")\nEOF'
+run "python3 heredoc with brace and curl key" allow 10 cmd $'python3 - <<\'EOF\'\ncfg = { curl: \'https://api.github.com/x\' }\nEOF'
 run "cat heredoc writing a doc that shows a polling loop" allow 10 cmd $'cat > notes.md <<\'EOF\'\n## Do not\nfor i in 1 2 3; do gh run list -L1; sleep 5; done\nEOF'
 run "tee heredoc writing a doc line with gh pr checks --watch" allow 10 cmd $'tee old.md <<EOF\ngh pr checks 1 --watch\nEOF'
 # Fed to a shell (directly, over ssh, or with sudo), the body runs: still judged.
@@ -246,18 +298,21 @@ run "while read over ssh -o \"a b\" x40 prose" allow 2 cmd "while read l; do ech
 # Logging: one JSON line per deny with the documented keys; rotate to hook.log.1 past 1 MB.
 log="$tmp/state/hook.log"
 long="gh run watch 1 $(printf 'x%.0s' $(seq 600))"
+too_long="gh run watch 1 $(printf 'z%.0s' $(seq 8500))"
 GH_QUOTA_HOOK_LOG=$log run "log: deny writes one line" DENY 10 cmd "$long"
-if why=$(python3 - "$log" <<'EOF'
+GH_QUOTA_HOOK_LOG=$log run "log: deny caps cmd at 8000" DENY 10 cmd "$too_long"
+if why=$(python3 - "$log" "${#long}" <<'EOF'
 import json, sys
 lines = open(sys.argv[1], encoding='utf-8').read().splitlines()
-assert len(lines) == 1, f'{len(lines)} lines'
-e = json.loads(lines[0])
+assert len(lines) == 2, f'{len(lines)} lines'
+e, e2 = json.loads(lines[0]), json.loads(lines[1])
 assert set(e) == {'ts', 'host', 'session', 'cwd', 'reason', 'cmd'}, sorted(e)
 assert e['session'] == 's1' and e['cwd'] == '/w', (e['session'], e['cwd'])
 assert e['reason'] and '，' not in e['reason'] and 'gh-wait' not in e['reason'], e['reason']
-assert len(e['cmd']) == 500 and e['cmd'].startswith('gh run watch 1 x'), len(e['cmd'])
+assert len(e['cmd']) == int(sys.argv[2]) and e['cmd'].startswith('gh run watch 1 x'), len(e['cmd'])
+assert len(e2['cmd']) == 8000 and e2['cmd'].startswith('gh run watch 1 z'), len(e2['cmd'])
 EOF
-); then echo "ok   log: keys, reason before '，', cmd capped at 500"; else echo "FAIL log line: $why"; fail=1; fi
+); then echo "ok   log: keys, reason before '，', cmd kept up to 8000"; else echo "FAIL log line: $why"; fail=1; fi
 python3 -c 'import sys; open(sys.argv[1], "a").write("y" * 1000001)' "$log"
 GH_QUOTA_HOOK_LOG=$log run "log: deny past 1 MB" DENY 10 cmd "gh run watch 2"
 if [ "$(wc -l < "$log" | tr -d ' ')" = 1 ] && [ "$(wc -c < "${log}.1" | tr -d ' ')" -gt 1000000 ]; then

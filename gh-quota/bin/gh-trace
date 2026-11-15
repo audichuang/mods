@@ -1,0 +1,556 @@
+#!/usr/bin/env bash
+# Logging shim in front of the real gh CLI (only logs invocations; never blocks).
+# Records who, what, and when (not duration or exit code).
+#
+#   gh-trace install [<gh path>]     Install POSIX /bin/sh shim (Homebrew: unlink gh + wrap opt/gh; else: gh.real)
+#   gh-trace uninstall [<gh path>]   Remove shim and restore gh (Homebrew: brew link gh; else: move gh.real back)
+#   gh-trace status [<gh path>]      Show shim install state, real gh path/--version, and log count
+#   gh-trace report [--since <MM-DD HH:MM>] [--window 5]
+#                                    Summarize per-window call counts, top 5 callers, and argv prefixes
+#
+# Homebrew keeps upgrading gh underneath (via <prefix>/opt/gh/bin/gh).
+# To uninstall: run `gh-trace uninstall`.
+
+is_our_shim() {
+    [ -f "$1" ] && head -c 256 "$1" 2>/dev/null | grep -q '^# gh-trace-shim-v1$'
+}
+
+usage() {
+    awk '/^# Logging shim/{f=1} f && /^[^#]/{exit} f{sub(/^# ?/, ""); print}' "$0" >&2
+    exit "${1:-2}"
+}
+
+resolve_shim_src() {
+    local p=$0 dir
+    while [ -L "$p" ]; do
+        dir=$(cd "$(dirname "$p")" 2>/dev/null && pwd)
+        p=$(readlink "$p")
+        case $p in
+            /*) ;;
+            *)  p="${dir}/$p" ;;
+        esac
+    done
+    dir=$(cd "$(dirname "$p")" 2>/dev/null && pwd)
+    printf '%s/gh-trace-shim.sh\n' "$dir"
+}
+
+same_thing() {
+    local a=$1 b=$2
+    if [ -L "$a" ] && [ -L "$b" ]; then
+        [ "$(readlink "$a" 2>/dev/null)" = "$(readlink "$b" 2>/dev/null)" ]
+    elif [ ! -L "$a" ] && [ ! -L "$b" ]; then
+        [ "$a" -ef "$b" ] || cmp -s "$a" "$b"
+    else
+        return 1
+    fi
+}
+
+resolve_gh_path() {
+    if [ $# -ge 1 ]; then
+        printf '%s\n' "$1"
+    else
+        local p bp
+        if p=$(command -v gh 2>/dev/null) && [ -n "$p" ]; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+        if command -v brew >/dev/null 2>&1 && brew --prefix gh >/dev/null 2>&1; then
+            bp=$(brew --prefix 2>/dev/null)
+            if [ -n "$bp" ]; then
+                printf '%s\n' "${bp}/bin/gh"
+                return 0
+            fi
+        fi
+        printf 'gh-trace: gh not found on PATH; pass <gh path> explicitly\n' >&2
+        return 1
+    fi
+}
+
+read_shim_var() {
+    local file=$1 key=$2
+    awk -v k="$key" '
+        index($0, k "=") == 1 {
+            v = substr($0, length(k) + 2)
+            sub(/^\047/, "", v); sub(/\047$/, "", v)
+            gsub(/\047\\\047\047/, "\047", v)
+            print v; exit
+        }
+    ' "$file" 2>/dev/null
+}
+
+write_shim() {
+    local dst=$1 real_default=$2 mode=$3 shim_src esc_r
+    shim_src=$(resolve_shim_src)
+    if [ ! -f "$shim_src" ]; then
+        printf 'gh-trace: shim template not found: %s\n' "$shim_src" >&2
+        return 1
+    fi
+    esc_r=${real_default//\'/\'\\\'\'}
+    awk -v r="$esc_r" -v m="$mode" '
+        /^GH_TRACE_REAL_DEFAULT=/ { print "GH_TRACE_REAL_DEFAULT=\047" r "\047"; next }
+        /^GH_TRACE_MODE=/ { print "GH_TRACE_MODE=\047" m "\047"; next }
+        { print }
+    ' "$shim_src" > "$dst"
+}
+
+is_brew_gh() {
+    local target=$1 bp link tdir tnorm
+    command -v brew >/dev/null 2>&1 || return 1
+    brew --prefix gh >/dev/null 2>&1 || return 1
+    bp=$(brew --prefix 2>/dev/null) || return 1
+    [ -n "$bp" ] || return 1
+    tdir=$(cd "$(dirname "$target")" 2>/dev/null && pwd) || return 1
+    tnorm="${tdir}/${target##*/}"
+    [ "$tnorm" = "${bp}/bin/gh" ] || return 1
+    [ -L "$target" ] || return 1
+    link=$(readlink "$target" 2>/dev/null) || return 1
+    case $link in
+        *Cellar/*) printf '%s\n' "$bp"; return 0 ;;
+        *)         return 1 ;;
+    esac
+}
+
+verify_installed_shim() {
+    local target=$1 ver rc
+    printf 'Verifying: %s --version\n' "$target"
+    ver=$(GH_TRACE_LOG=/dev/null "$target" --version </dev/null 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$ver" ]; then
+        printf 'gh-trace: ERROR: installed shim failed verification (%s --version exited %d): %s\n' \
+            "$target" "$rc" "$ver" >&2
+        return 1
+    fi
+    printf 'Verified: %s\n' "$(printf '%s\n' "$ver" | head -n 1)"
+    return 0
+}
+
+cmd_install() {
+    [ $# -le 1 ] || usage
+    local target dir real tmp brew_prefix opt_gh had_real=0
+    target=$(resolve_gh_path "$@") || exit 1
+
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        printf 'gh-trace: target does not exist: %s\n' "$target" >&2
+        exit 1
+    fi
+
+    if is_our_shim "$target"; then
+        printf 'gh-trace: already installed at %s\n' "$target"
+        exit 0
+    fi
+
+    dir=$(dirname "$target")
+    tmp="${dir}/.gh-trace.tmp.$$"
+
+    if brew_prefix=$(is_brew_gh "$target"); then
+        opt_gh="${brew_prefix}/opt/gh/bin/gh"
+        if [ ! -x "$opt_gh" ]; then
+            printf 'gh-trace: Homebrew opt gh not found or not executable: %s\n' "$opt_gh" >&2
+            exit 1
+        fi
+        printf 'Detected Homebrew gh at %s (real gh: %s)\n' "$target" "$opt_gh"
+        printf 'Running: brew unlink gh\n'
+        brew unlink gh || { printf 'gh-trace: brew unlink gh failed\n' >&2; exit 1; }
+
+        printf 'Writing shim to %s\n' "$target"
+        if ! write_shim "$tmp" "$opt_gh" "homebrew" || ! chmod +x "$tmp" || ! mv -f "$tmp" "$target"; then
+            rm -f "$tmp"
+            printf 'Rolling back: brew link gh\n' >&2
+            brew link gh >/dev/null 2>&1 || true
+            printf 'gh-trace: failed to write shim at %s\n' "$target" >&2
+            exit 1
+        fi
+
+        if ! verify_installed_shim "$target"; then
+            printf 'Rolling back: removing %s and running brew link gh\n' "$target" >&2
+            rm -f "$target"
+            brew link gh >/dev/null 2>&1 || true
+            exit 1
+        fi
+
+        printf 'Installed gh-trace shim at %s (Homebrew keeps %s updated on upgrades).\n' "$target" "$opt_gh"
+        printf 'Uninstall: gh-trace uninstall %s\n' "$target"
+        exit 0
+    fi
+
+    real="${dir}/gh.real"
+    if [ -e "$real" ] || [ -L "$real" ]; then
+        if ! same_thing "$target" "$real"; then
+            printf 'gh-trace: refusing to overwrite existing %s (differs from %s)\n' "$real" "$target" >&2
+            exit 1
+        fi
+        had_real=1
+        printf 'Removing duplicate %s (%s already matches)\n' "$target" "$real"
+        rm -f "$target" || { printf 'gh-trace: failed to remove %s\n' "$target" >&2; exit 1; }
+    else
+        printf 'Moving %s to %s\n' "$target" "$real"
+        mv "$target" "$real" || { printf 'gh-trace: failed to move %s to %s\n' "$target" "$real" >&2; exit 1; }
+    fi
+
+    printf 'Writing shim to %s\n' "$target"
+    if ! write_shim "$tmp" "" "real" || ! chmod +x "$tmp" || ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp"
+        if [ "$had_real" -eq 0 ]; then
+            printf 'Rolling back: moving %s back to %s\n' "$real" "$target" >&2
+            mv -f "$real" "$target" 2>/dev/null || true
+        fi
+        printf 'gh-trace: failed to install shim at %s\n' "$target" >&2
+        exit 1
+    fi
+
+    if ! verify_installed_shim "$target"; then
+        printf 'Rolling back: removing %s\n' "$target" >&2
+        rm -f "$target"
+        if [ "$had_real" -eq 0 ]; then
+            mv -f "$real" "$target" 2>/dev/null || true
+        elif [ -L "$real" ]; then
+            ln -s "$(readlink "$real")" "$target" 2>/dev/null || true
+        else
+            cp -p "$real" "$target" 2>/dev/null || true
+        fi
+        exit 1
+    fi
+
+    printf 'Installed gh-trace shim at %s (real gh at %s).\n' "$target" "$real"
+    printf 'Uninstall: gh-trace uninstall %s\n' "$target"
+    exit 0
+}
+
+cmd_uninstall() {
+    [ $# -le 1 ] || usage
+    local target dir real mode bak ver bp tdir tnorm
+    target=$(resolve_gh_path "$@") || exit 1
+
+    dir=$(dirname "$target")
+    real="${dir}/gh.real"
+
+    if is_our_shim "$target"; then
+        mode=$(read_shim_var "$target" "GH_TRACE_MODE")
+        if [ "$mode" = "homebrew" ]; then
+            bak="${target}.gh-trace-bak.$$"
+            printf 'Moving shim %s to backup %s\n' "$target" "$bak"
+            mv -f "$target" "$bak" || { printf 'gh-trace: failed to move %s aside\n' "$target" >&2; exit 1; }
+            printf 'Running: brew link gh\n'
+            if brew link gh && ver=$("$target" --version </dev/null 2>&1) && [ -n "$ver" ]; then
+                rm -f "$bak"
+                printf 'Verified: %s\n' "$(printf '%s\n' "$ver" | head -n 1)"
+                printf 'Uninstalled gh-trace shim; Homebrew gh restored at %s.\n' "$target"
+                exit 0
+            fi
+            printf 'gh-trace: ERROR: brew link gh or verification failed; restoring shim\n' >&2
+            rm -f "$target" 2>/dev/null || true
+            if mv -f "$bak" "$target"; then
+                printf 'gh-trace: shim restored at %s. Manual fix: rm -f %s && brew link gh\n' "$target" "$target" >&2
+            else
+                printf 'gh-trace: CRITICAL: failed to restore %s from %s. Manual fix: mv %s %s or brew link gh\n' \
+                    "$target" "$bak" "$bak" "$target" >&2
+            fi
+            exit 1
+        fi
+        if [ ! -e "$real" ] && [ ! -L "$real" ]; then
+            printf 'gh-trace: %s is missing; refusing to remove %s\n' "$real" "$target" >&2
+            exit 1
+        fi
+        printf 'Restoring %s to %s\n' "$real" "$target"
+        mv -f "$real" "$target" || { printf 'gh-trace: failed to restore %s to %s\n' "$real" "$target" >&2; exit 1; }
+        printf 'Uninstalled gh-trace shim; restored %s.\n' "$target"
+        exit 0
+    fi
+
+    if [ -e "$real" ] || [ -L "$real" ]; then
+        printf 'gh-trace: %s is not a gh-trace shim; refusing to clobber (%s still exists)\n' "$target" "$real" >&2
+        exit 1
+    fi
+
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        if command -v brew >/dev/null 2>&1 && brew --prefix gh >/dev/null 2>&1; then
+            bp=$(brew --prefix 2>/dev/null || true)
+            tdir=$(cd "$(dirname "$target")" 2>/dev/null && pwd || true)
+            tnorm="${tdir}/${target##*/}"
+            if [ -n "$bp" ] && [ "$tnorm" = "${bp}/bin/gh" ]; then
+                printf 'gh-trace: %s is absent and Homebrew gh appears unlinked; running brew link gh\n' "$target"
+                if brew link gh && ver=$("$target" --version </dev/null 2>&1) && [ -n "$ver" ]; then
+                    printf 'Verified: %s\n' "$(printf '%s\n' "$ver" | head -n 1)"
+                    printf 'Restored %s via brew link gh.\n' "$target"
+                    exit 0
+                fi
+                printf 'gh-trace: ERROR: brew link gh failed while %s is missing. Manual fix: brew link gh\n' "$target" >&2
+                exit 1
+            fi
+        fi
+        printf 'gh-trace: not installed at %s (nothing to do)\n' "$target"
+        exit 0
+    fi
+
+    printf 'gh-trace: %s is not a gh-trace shim (leaving untouched)\n' "$target"
+    exit 0
+}
+
+cmd_status() {
+    [ $# -le 1 ] || usage
+    local target='' real_gh='' ver='' log lines=0 mode='' bp=''
+    if [ $# -ge 1 ]; then
+        target=$1
+    else
+        target=$(command -v gh 2>/dev/null || true)
+        if [ -z "$target" ] && command -v brew >/dev/null 2>&1 && brew --prefix gh >/dev/null 2>&1; then
+            bp=$(brew --prefix 2>/dev/null || true)
+            [ -n "$bp" ] && { [ -e "${bp}/bin/gh" ] || [ -L "${bp}/bin/gh" ]; } && target="${bp}/bin/gh"
+        fi
+    fi
+
+    log=${GH_TRACE_LOG:-$HOME/.local/state/gh-quota/gh-trace.log}
+
+    if [ -n "$target" ] && is_our_shim "$target"; then
+        mode=$(read_shim_var "$target" "GH_TRACE_MODE")
+        real_gh=$(read_shim_var "$target" "GH_TRACE_REAL_DEFAULT")
+        [ -n "$real_gh" ] || real_gh="$(dirname "$target")/gh.real"
+        [ -n "${GH_TRACE_REAL:-}" ] && real_gh=$GH_TRACE_REAL
+        printf 'shim: installed at %s%s\n' "$target" "${mode:+ ($mode)}"
+        if [ -x "$real_gh" ]; then
+            ver=$("$real_gh" --version </dev/null 2>&1 | head -n 1)
+            printf 'real gh: %s (exists; %s)\n' "$real_gh" "${ver:-unknown version}"
+        else
+            printf 'real gh: %s (missing or not executable)\n' "$real_gh"
+        fi
+    else
+        printf 'shim: not installed (%s)\n' "${target:-gh not found}"
+        if [ -n "$target" ] && [ -x "$target" ]; then
+            ver=$("$target" --version </dev/null 2>&1 | head -n 1)
+            printf 'real gh: %s (exists; %s)\n' "$target" "${ver:-unknown version}"
+        else
+            printf 'real gh: none\n'
+        fi
+    fi
+
+    if [ -f "$log" ]; then
+        lines=$(wc -l < "$log" | tr -d ' ')
+        printf 'log: %s (%s lines)\n' "$log" "$lines"
+    else
+        printf 'log: %s (does not exist, 0 lines)\n' "$log"
+    fi
+}
+
+cmd_report() {
+    local since='' window=5 log
+    log=${GH_TRACE_LOG:-$HOME/.local/state/gh-quota/gh-trace.log}
+
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --since)
+                [ $# -ge 2 ] || usage
+                since=$2; shift 2 ;;
+            --since=*)
+                since=${1#*=}; shift ;;
+            --window)
+                [ $# -ge 2 ] || usage
+                window=$2; shift 2 ;;
+            --window=*)
+                window=${1#*=}; shift ;;
+            -h|--help)
+                usage 0 ;;
+            *)
+                usage ;;
+        esac
+    done
+
+    [[ $window =~ ^[1-9][0-9]*$ ]] || {
+        printf 'gh-trace: --window must be a positive integer (got %s)\n' "$window" >&2
+        exit 2
+    }
+
+    local since_cmp='' yr
+    if [ -n "$since" ]; then
+        yr=$(date +%Y)
+        if [[ $since =~ ^([0-9]{2}-[0-9]{2})[[:space:]T]([0-9]{2}:[0-9]{2})$ ]]; then
+            since_cmp="${yr}-${BASH_REMATCH[1]}T${BASH_REMATCH[2]}"
+        elif [[ $since =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]T]([0-9]{2}:[0-9]{2})$ ]]; then
+            since_cmp="${BASH_REMATCH[1]}T${BASH_REMATCH[2]}"
+        else
+            printf 'gh-trace: --since must be "MM-DD HH:MM" or "YYYY-MM-DD HH:MM" (got %s)\n' "$since" >&2
+            exit 2
+        fi
+    fi
+
+    if [ ! -f "$log" ]; then
+        printf 'No log file at %s\n' "$log"
+        exit 0
+    fi
+
+    awk -F '\t' -v win="$window" -v since="$since_cmp" '
+    function is_shell(b) {
+        return (b == "sh" || b == "bash" || b == "dash" || b == "zsh" || b == "fish" || b == "ksh")
+    }
+    function is_interp(b) {
+        return (b == "node" || b == "nodejs" || b == "python" || b == "python3" || b == "python2" || \
+                b == "ruby" || b == "perl" || b == "bun" || b == "deno" || is_shell(b) || b == "osascript")
+    }
+    function is_wrapper(b) {
+        return (b == "env" || b == "timeout" || b == "nice" || b == "nohup" || b == "time" || \
+                b == "xargs" || b == "sudo" || b == "doas" || b == "login")
+    }
+    function is_init(b) {
+        return (b == "launchd" || b == "systemd" || b == "init")
+    }
+    function base_name(s,   b) {
+        b = s
+        sub(/^.*\//, "", b)
+        sub(/^-/, "", b)
+        return b
+    }
+    function first_nonflag(toks, nt, start,   i) {
+        for (i = start; i <= nt; i++) {
+            if (toks[i] !~ /^-/) return toks[i]
+        }
+        return ""
+    }
+    function caller_group(chain,   n, anc, i, cmd, nt, toks, exe, b, arg, chosen, pos) {
+        if (chain == "" || chain == "-") return "(unknown)"
+        n = split(chain, anc, / < /)
+        chosen = ""
+        for (i = 1; i <= n; i++) {
+            cmd = anc[i]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", cmd)
+            if (cmd == "") continue
+            nt = split(cmd, toks, /[[:space:]]+/)
+            exe = toks[1]
+            b = base_name(exe)
+            if (is_init(b)) break
+            if (is_wrapper(b)) continue
+            if (is_shell(b)) {
+                if (nt >= 2 && toks[2] !~ /^-/) {
+                    chosen = cmd
+                    break
+                }
+                if (nt >= 3 && cmd !~ /[[:space:]]-[A-Za-z]*c([[:space:]]|$)/) {
+                    arg = first_nonflag(toks, nt, 2)
+                    if (arg != "" && toks[2] != "-o") {
+                        chosen = cmd
+                        break
+                    }
+                }
+                continue
+            }
+            chosen = cmd
+            break
+        }
+        if (chosen == "") {
+            chosen = anc[1]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", chosen)
+            if (chosen == "") return "(unknown)"
+        }
+        if (index(chosen, ".app/") > 0) {
+            pos = match(chosen, /[[:space:]]+-/)
+            if (pos > 0) return substr(chosen, 1, pos - 1)
+            return chosen
+        }
+        nt = split(chosen, toks, /[[:space:]]+/)
+        exe = toks[1]
+        b = base_name(exe)
+        if (is_interp(b)) {
+            if (nt >= 2 && (toks[2] == "-c" || toks[2] == "-e")) return exe
+            arg = first_nonflag(toks, nt, 2)
+            if (arg != "") return exe " " arg
+        }
+        return exe
+    }
+    function argv_prefix(argv,   n, w, out, i) {
+        n = split(argv, w, /[[:space:]]+/)
+        if (n == 0) return ""
+        if (n > 3) n = 3
+        out = ""
+        for (i = 1; i <= n; i++) {
+            if (i == 3 || (w[i] ~ /\?/ && w[i] ~ /\//)) sub(/\?.*$/, "", w[i])
+            out = (i == 1 ? w[i] : out " " w[i])
+        }
+        return out
+    }
+    {
+        ts = $1
+        if (length(ts) < 16) next
+        ts_cmp = substr(ts, 1, 16)
+        if (since != "" && ts_cmp < since) next
+
+        date_part = substr(ts, 1, 10)
+        hh = substr(ts, 12, 2) + 0
+        mm = substr(ts, 15, 2) + 0
+        tot = hh * 60 + mm
+        bmin = int(tot / win) * win
+        bucket = sprintf("%s %02d:%02d", date_part, int(bmin / 60), bmin % 60)
+
+        if (!(bucket in seen_w)) {
+            seen_w[bucket] = 1
+            wins[++nw] = bucket
+        }
+        w_total[bucket]++
+
+        c = caller_group($7)
+        wc = bucket SUBSEP c
+        if (!(wc in wc_cnt)) {
+            wc_idx[bucket, ++wc_n[bucket]] = c
+        }
+        wc_cnt[wc]++
+
+        p = argv_prefix($8)
+        wcp = bucket SUBSEP c SUBSEP p
+        if (!(wcp in wcp_cnt)) {
+            wcp_idx[wc, ++wcp_n[wc]] = p
+        }
+        wcp_cnt[wcp]++
+    }
+    END {
+        if (nw == 0) {
+            print "No matching log entries."
+            exit 0
+        }
+        for (i = 1; i <= nw; i++) {
+            for (j = i + 1; j <= nw; j++) {
+                if (wins[j] < wins[i]) {
+                    tmp = wins[i]; wins[i] = wins[j]; wins[j] = tmp
+                }
+            }
+        }
+        for (i = 1; i <= nw; i++) {
+            b = wins[i]
+            printf "%s  total: %d\n", b, w_total[b]
+            nc = wc_n[b]
+            split("", used)
+            limit = (nc < 5 ? nc : 5)
+            for (k = 1; k <= limit; k++) {
+                best_c = ""; best_n = -1
+                for (j = 1; j <= nc; j++) {
+                    c = wc_idx[b, j]
+                    if (c in used) continue
+                    cnt = wc_cnt[b, c]
+                    if (cnt > best_n || (cnt == best_n && c < best_c)) {
+                        best_n = cnt; best_c = c
+                    }
+                }
+                used[best_c] = 1
+                wc = b SUBSEP best_c
+                np = wcp_n[wc]
+                best_p = ""; best_pn = -1
+                for (j = 1; j <= np; j++) {
+                    p = wcp_idx[wc, j]
+                    pn = wcp_cnt[wc, p]
+                    if (pn > best_pn || (pn == best_pn && p < best_p)) {
+                        best_pn = pn; best_p = p
+                    }
+                }
+                printf "  %5d  %s  (top: %s)\n", best_n, best_c, best_p
+            }
+        }
+    }
+    ' "$log"
+}
+
+[ $# -ge 1 ] || usage
+subcmd=$1; shift
+case $subcmd in
+    install)   cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    status)    cmd_status "$@" ;;
+    report)    cmd_report "$@" ;;
+    -h|--help|help) usage 0 ;;
+    *)         usage ;;
+esac

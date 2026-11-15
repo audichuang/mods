@@ -17,7 +17,7 @@ LOG_MAX_BYTES = 1_000_000
 # then optional VAR=x and wrappers. Quotes count so that `ssh host 'gh run watch'` and
 # `bash -c "..."` are caught (the remote side has no hook); the cost is that prose in a
 # quoted string starting with `gh run watch` is blocked too.
-SEP = r'(?:^|[;&|(!\n"\']|\$\(|\b(?:do|then|while|until|if)\b)\s*'
+SEP = r'(?:^|[;&|(!\n"\']|(?<!\$)\{(?=\s)|\$\(|\b(?:do|then|while|until|if)\b)\s*'
 # One shell word, quotes included (`"StrictHostKeyChecking no"`, `X="a b"`). Each character
 # has exactly one way to match, so a word ends only at unquoted whitespace.
 WORD = r'''(?:[^\s'"]|'[^']*'|"(?:\\.|[^"\\])*")+'''
@@ -36,13 +36,13 @@ POS = SEP + WRAP
 PATH_PREFIX = r'(?:[^\s;&|()<>\'"`]*/)?'  # a command called by path: /opt/homebrew/bin/gh
 GH = PATH_PREFIX + r'gh'
 REPO = r'(?:\s+(?:-R\s*|--repo(?:\s+|=))[^\s;&|]+)*'
-WATCH = re.compile(POS + GH + REPO + r'\s+run' + REPO + r'\s+watch\b')
-CHECKS = re.compile(POS + GH + REPO + r'\s+pr' + REPO + r'\s+checks\b[^;&|\n]*--watch')
+WATCH = re.compile(POS + r'(?P<gh>' + GH + r')' + REPO + r'\s+run' + REPO + r'\s+watch\b')
+CHECKS = re.compile(POS + r'(?P<gh>' + GH + r')' + REPO + r'\s+pr' + REPO + r'\s+checks\b[^;&|\n]*--watch')
 # watch(1) re-runs its command forever, every 2 s by default.
 WATCH_CMD = re.compile(POS + r'(?P<cmd>watch)\b[^;&|\n]*\bgh\s')
 # Loop keywords and `done` at command position; matched on a copy with quoted text blanked,
 # so `echo "done"` or `x-done` never closes a loop.
-LOOP_KW = re.compile(r'(?:^|[;&|(\n]|\bdo\b|\bthen\b|\belse\b)\s*(while|until|for|done)\b')
+LOOP_KW = re.compile(r'(?:^|[;&|(\n]|(?<!\$)\{(?=\s)|\bdo\b|\bthen\b|\belse\b)\s*(while|until|for|done)\b')
 # `while read …` consumes finite input (a file, a pipe), so like `for` it is a batch, not polling.
 READ_COND = re.compile(r'\s+(?:\w+=(?:' + WORD + r')?\s+)*read\b')
 QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
@@ -63,7 +63,7 @@ UNIT = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
 # A backslash-newline continues the same command, so `\\<newline>  -H "Authorization: …"`
 # still belongs to that curl.
 ARGS = r'(?:[^;&|\n\\]|\\[\s\S])*'
-ANON_CURL = re.compile(POS + r'(?:curl|wget)\b' + ARGS + r'(?i:api\.github\.com)(?!/rate_limit\b)' + ARGS)
+ANON_CURL = re.compile(POS + r'(?P<cmd>curl|wget)\b' + ARGS + r'(?i:api\.github\.com)(?!/rate_limit\b)' + ARGS)
 AUTH = re.compile(r'(?i)authorization:|\$\(gh auth token\)|\$\{?(?:GITHUB_TOKEN|GH_TOKEN)\b')
 # Wrappers whose quoted argument is itself a command line (sh -c, ssh host, eval): their
 # loops are hidden from loops(), so reason() runs again on the unquoted argument. Group w
@@ -89,10 +89,131 @@ def feeds_shell(cmd, i):
 CODE, QUOTE, HEREDOC_BODY = 0, 1, 2
 MAX_DEPTH = 3
 
-HINT = ('等 CI 請改用 `gh-wait run <run-id> -R owner/repo`、`gh-wait pr <number> -R owner/repo`，'
-        '沒有 PR 的 push（等 run 出現再跑完）用 `gh-wait commit <sha> -R owner/repo`'
-        '（ETag 條件請求，狀態沒變時 304 不扣額度；放背景跑，結束會通知）。'
-        '如果是為了等 checks 過了就合併，考慮 `gh pr merge --auto`。')
+HINT = ('\n等 CI 在 push 的 checkout 跑 gh-wait（不帶參數；別的目錄加 -C <dir>），或指定 '
+        '`gh-wait run <run-id> -R owner/repo`、`gh-wait pr <number> -R owner/repo`、`gh-wait commit <sha> -R owner/repo`。\n'
+        '推 tag 等 release 務必加 `--workflow <檔名>`（例 `gh-wait --workflow release.yml`、'
+        '`gh-wait commit <sha> -R owner/repo --workflow <檔名>`），否則會誤等 main 的綠燈就結束'
+        '（ETag 304 不扣額度；要過了就合併用 `gh pr merge --auto`）。\n'
+        '放背景跑，等通知。')
+
+_WORD_RE = re.compile(WORD)
+_REPO_VAL = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+_WORKFLOW_VAL = re.compile(r'^[A-Za-z0-9_.][A-Za-z0-9_./-]*$')
+_API_RUN_RE = re.compile(
+    r'(?:repos/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/[^\s]*?)?'
+    r'(?:actions/runs(?:/(\d+)(?=[/?#\s]|$))?|actions/jobs\b|check-runs\b|check-suites\b)'
+)
+_PR_STATE_RE = re.compile(r'\b(?:state|mergeable|comments)\b')
+_PR_CHECKS_RE = re.compile(r'\b(?:statusCheckRollup|checks)\b')
+_VALUE_FLAGS = frozenset({'-R', '--repo', '-i', '--interval', '-t', '--template',
+                          '-j', '--job', '-a', '--attempt', '-q', '--jq', '--json',
+                          '-w', '--workflow', '-c', '--commit', '-b', '--branch',
+                          '-L', '--limit', '-X', '--method', '-H', '--header',
+                          '-f', '-F', '--field', '--raw-field', '--input'})
+
+
+def _unquote(tok):
+    return tok[1:-1] if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"') else tok
+
+
+def _cmd_end(cmd, mask, start, limit):
+    return next((k for k in range(start, limit) if cmd[k] in ';&|\n)<>' and mask[k] == CODE), limit)
+
+
+def _hint_for_call(call_slice):
+    tokens = _WORD_RE.findall(call_slice)
+    repo = None
+    workflow = None
+    pos = []
+    i = 1
+    while i < len(tokens):
+        t = _unquote(tokens[i])
+        if t in ('-R', '--repo'):
+            if i + 1 < len(tokens):
+                cand = _unquote(tokens[i + 1])
+                if _REPO_VAL.fullmatch(cand):
+                    repo = cand
+                i += 2
+                continue
+        elif t.startswith('--repo='):
+            cand = _unquote(t[7:])
+            if _REPO_VAL.fullmatch(cand):
+                repo = cand
+        elif t.startswith('-R') and len(t) > 2:
+            cand = _unquote(t[2:])
+            if _REPO_VAL.fullmatch(cand):
+                repo = cand
+        elif t in ('-w', '--workflow'):
+            if i + 1 < len(tokens):
+                cand = _unquote(tokens[i + 1])
+                if _WORKFLOW_VAL.fullmatch(cand):
+                    workflow = cand
+                i += 2
+                continue
+        elif t.startswith('--workflow='):
+            cand = _unquote(t[11:])
+            if _WORKFLOW_VAL.fullmatch(cand):
+                workflow = cand
+        elif t.startswith('-w') and len(t) > 2:
+            cand = _unquote(t[2:])
+            if _WORKFLOW_VAL.fullmatch(cand):
+                workflow = cand
+        elif t in _VALUE_FLAGS:
+            i += 2
+            continue
+        elif not t.startswith('-'):
+            pos.append(t)
+        i += 1
+    if not pos:
+        return None
+    repo_arg = f'-R {repo}' if repo else '-R owner/repo'
+    group = pos[0]
+    sub = pos[1] if len(pos) > 1 else ''
+    if group == 'run' and sub == 'list':
+        if workflow:
+            return (f'\n在 push 的 checkout 直接跑 `gh-wait --workflow {workflow}`（別的目錄加 -C <dir>），'
+                    f'或指定 `gh-wait commit <sha> {repo_arg} --workflow {workflow}`（ETag 304 不扣額度）。\n'
+                    '放背景跑，等通知。')
+        return (f'\n在 push 的 checkout 直接跑 gh-wait（不帶參數；別的目錄加 -C <dir>），'
+                f'已知 sha 用 `gh-wait commit <sha> {repo_arg}`（ETag 304 不扣額度）。\n'
+                '推 tag 等 release 務必加 `--workflow <檔名>`（例 `gh-wait --workflow release.yml`、'
+                f'`gh-wait commit <sha> {repo_arg} --workflow <檔名>`），否則會誤等 main 的綠燈就結束。\n'
+                '放背景跑，等通知。')
+    if group == 'run' and sub in ('view', 'watch'):
+        rid = pos[2] if len(pos) > 2 and pos[2].isascii() and pos[2].isdigit() else '<run-id>'
+        return (f'\n改用 `gh-wait run {rid} {repo_arg}`（ETag 304 不扣額度，失敗會印出失敗 job 的 log）。\n'
+                '放背景跑，等通知。')
+    if group == 'pr' and sub in ('view', 'checks'):
+        num = pos[2] if len(pos) > 2 and pos[2].isascii() and pos[2].isdigit() else '<number>'
+        if sub == 'view' and _PR_STATE_RE.search(call_slice) and not _PR_CHECKS_RE.search(call_slice):
+            return (f'\n`gh-wait` 不等 PR 的 state／mergeable／comments（它只等 checks）；'
+                    f'請改為單次 `gh pr view {num} {repo_arg}` 確認，或用 `gh pr merge --auto`。\n'
+                    '若需等待請放背景跑，等通知。')
+        return (f'\n等 PR checks 請改用 `gh-wait pr {num} {repo_arg}`（ETag 304 不扣額度，失敗會印出失敗 job 的 log）。\n'
+                '放背景跑，等通知。')
+    if group == 'api':
+        m = _API_RUN_RE.search(' '.join(pos[1:]))
+        if m:
+            api_repo = repo or m.group(1)
+            rid = m.group(2) or '<run-id>'
+            repo_part = f' -R {api_repo}' if api_repo else ''
+            return (f'\n改用 `gh-wait run {rid}{repo_part}`（會回報各 job 進度與失敗 job 的 log；ETag 304 不扣額度）。\n'
+                    '放背景跑，等通知。')
+    return None
+
+
+def _hint_for_span(cmd, mask, start, end, depth):
+    for m in GH_CALL.finditer(cmd, start, end):
+        if mask[m.start('gh')] == CODE:
+            h = _hint_for_call(cmd[m.start('gh'):_cmd_end(cmd, mask, m.start('gh'), end)])
+            if h:
+                return h
+    if depth < MAX_DEPTH:
+        for inner in payloads(cmd, mask, start, end):
+            h = _hint_for_span(inner, code_mask(inner), 0, len(inner), depth + 1)
+            if h != HINT:
+                return h
+    return HINT
 
 
 def code_mask(cmd):
@@ -252,27 +373,31 @@ def batch(cmd, mask, kind, start, end):
     return bool(calls)
 
 
-def reason(cmd, depth=0):
+def judge(cmd, depth=0):
     if 'gh' not in cmd and 'github' not in cmd.lower():
-        return None
+        return None, None
     mask = code_mask(cmd)
 
     # A match inside quoted text is a search pattern or a message (grep "x|gh run …");
     # a quoted command that does run (bash -c '…', ssh host '…') is judged as a payload below.
     # Judged at the command word: gh's subcommand for gh, and for watch(1) the word itself, since
     # its quoted argument (watch "gh pr view 1") is the command it re-runs.
-    def runs(pattern, at=lambda m: m.end() - 1):
-        return any(mask[at(m)] == CODE for m in pattern.finditer(cmd))
+    def match(pattern, at=lambda m: m.end() - 1):
+        return next((m for m in pattern.finditer(cmd) if mask[at(m)] == CODE), None)
 
-    if runs(WATCH):
-        return '`gh run watch` 每輪打 2 個請求加每個執行中 job 1 個，會吃光共用的 5000/hr GitHub 額度。'
-    if runs(CHECKS):
-        return '`gh pr checks --watch` 是固定間隔輪詢，會吃光共用的 5000/hr GitHub 額度。'
-    if any(not AUTH.search(m.group(0)) for m in ANON_CURL.finditer(cmd)):
+    m = match(WATCH)
+    if m:
+        h = _hint_for_call(cmd[m.start('gh'):_cmd_end(cmd, mask, m.start('gh'), len(cmd))]) or HINT
+        return '`gh run watch` 每輪打 2 個請求加每個執行中 job 1 個，會吃光共用的 5000/hr GitHub 額度。', h
+    m = match(CHECKS)
+    if m:
+        h = _hint_for_call(cmd[m.start('gh'):_cmd_end(cmd, mask, m.start('gh'), len(cmd))]) or HINT
+        return '`gh pr checks --watch` 是固定間隔輪詢，會吃光共用的 5000/hr GitHub 額度。', h
+    if any(mask[m.start('cmd')] == CODE and not AUTH.search(m.group(0)) for m in ANON_CURL.finditer(cmd)):
         return ('沒帶 token 的 curl／wget 打 api.github.com，吃的是出口 IP 共用的每小時 60 次匿名額度；'
-                '改用 `gh api <path>`（走帳號的 5000 次）。')
-    if runs(WATCH_CMD, lambda m: m.start('cmd')):
-        return '`watch … gh` 會每隔幾秒重跑 gh，會吃光共用的 5000/hr GitHub 額度。'
+                '改用 `gh api <path>`（走帳號的 5000 次）。'), HINT
+    if match(WATCH_CMD, lambda m: m.start('cmd')):
+        return '`watch … gh` 會每隔幾秒重跑 gh，會吃光共用的 5000/hr GitHub 額度。', HINT
     for kind, start, end in loops(cmd):
         if not gh_called(cmd, mask, start, end, depth):
             continue
@@ -282,21 +407,28 @@ def reason(cmd, depth=0):
         args = [a.strip('\'"') for a in SLEEP.findall(body)]
         lits = [LITERAL.fullmatch(a) for a in args]
         sleeps = [float(m.group(1)) * UNIT[m.group(2)] for m in lits if m]
-        if sleeps and min(sleeps) < 60:
-            return f'用 sleep {min(sleeps):g} 秒的迴圈輪詢 gh，會吃光共用的 5000/hr GitHub 額度。'
-        if not all(lits):
-            return ('sleep 的間隔是變數或算式，hook 看不出有沒有至少 60 秒；'
-                    '用迴圈輪詢 gh 會吃光共用的 5000/hr GitHub 額度。')
         # A `while read` that got here is not a batch (gh ignores what it reads), so without
         # sleep it spins like while/until; `for` over a fixed list ends by itself.
-        if not args and kind in ('while', 'until', 'read'):
-            return '沒有 sleep 的 while／until 迴圈呼叫 gh，會連續狂打共用的 5000/hr GitHub 額度。'
+        why = None
+        if sleeps and min(sleeps) < 60:
+            why = f'用 sleep {min(sleeps):g} 秒的迴圈輪詢 gh，會吃光共用的 5000/hr GitHub 額度。'
+        elif not all(lits):
+            why = ('sleep 的間隔是變數或算式，hook 看不出有沒有至少 60 秒；'
+                   '用迴圈輪詢 gh 會吃光共用的 5000/hr GitHub 額度。')
+        elif not args and kind in ('while', 'until', 'read'):
+            why = '沒有 sleep 的 while／until 迴圈呼叫 gh，會連續狂打共用的 5000/hr GitHub 額度。'
+        if why:
+            return why, _hint_for_span(cmd, mask, start, end, depth)
     if depth < MAX_DEPTH:
         for inner in payloads(cmd, mask):
-            why = reason(inner, depth + 1)
+            why, h = judge(inner, depth + 1)
             if why:
-                return why
-    return None
+                return why, h
+    return None, None
+
+
+def reason(cmd, depth=0):
+    return judge(cmd, depth)[0]
 
 
 def log_deny(data, cmd, why):
@@ -311,7 +443,7 @@ def log_deny(data, cmd, why):
                 'session': data.get('session_id'),
                 'cwd': data.get('cwd'),
                 'reason': why.split('，')[0],
-                'cmd': cmd[:500],
+                'cmd': cmd[:8000],
             }, ensure_ascii=False) + '\n')
     except OSError:
         pass
@@ -328,13 +460,13 @@ def main():
     cmd = tool_input.get('command') if isinstance(tool_input, dict) else None
     if not isinstance(cmd, str):
         return
-    why = reason(cmd)
+    why, advice = judge(cmd)
     if why:
         log_deny(data, cmd, why)
         json.dump({'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
             'permissionDecision': 'deny',
-            'permissionDecisionReason': why + HINT,
+            'permissionDecisionReason': why + advice,
         }}, sys.stdout, ensure_ascii=False)
 
 
