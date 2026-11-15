@@ -19,7 +19,8 @@ export function isEnglish(text: string): boolean | undefined {
 
 // Pasted material (logs, terminal output, a page) is not the person's choice
 // of language; only what they typed around it is.
-const PASTE = /<pasted_content[^>]*>[\s\S]*?<\/pasted_content[^>]*>/g
+// The closing tag repeats the opener's id, so a literal </pasted_content> inside stays pasted.
+const PASTE = /<pasted_content( id="[^"]*")?>[\s\S]*?<\/pasted_content\1>/g
 
 // After this many reminders in a row that the next step ignored, stop until a
 // Chinese step or any new prompt: repeating it further only spends context.
@@ -52,8 +53,8 @@ export const register: Register = on => {
       drifted = false
     }
     // A new prompt, typed or delivered, starts a fresh run of misses; meta
-    // notices arriving mid-turn (task notifications) do not.
-    if (!e.isMeta) misses = 0
+    // notices and background-task notifications landing mid-turn do not.
+    if (!e.isMeta && e.origin.kind !== 'task-notification') misses = 0
     return next(e)
   })
 

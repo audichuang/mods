@@ -274,7 +274,8 @@ test('a short Chinese line around an English paste keeps the reminder on', async
 })
 
 test('isEnglish: URLs of any scheme do not count', () => {
-  expect(isEnglish('codex://threads/someVeryLongThreadIdentifierWithManyEnglishLettersInIt')).toBeUndefined()
+  // the query string is where the old https?-only rule left letters behind
+  expect(isEnglish('codex://threads/01a18d4f-aaaa?hostId=remote-control%3AenvironmentWithManyEnglishLettersInIt')).toBeUndefined()
   expect(isEnglish('看 vscode://file/aaaa，' + ZH)).toBe(false)
 })
 
@@ -311,6 +312,23 @@ test('a new prompt resets the miss count', async ($, on) => {
   await $.prompt.submit(typed('幫我修這個 bug'))
   for (let i = 0; i < MAX_MISSES + 1; i++) { await step($); await bash($) }
   await $.prompt.submit(typed('繼續'))
+  await step($)
+  expect((await bash($)).context).toEqual([REMINDER])
+})
+
+test('a background-task notification mid-turn does not reopen the reminders', async ($, on) => {
+  setup(on, EN)
+  await $.prompt.submit(typed('幫我修這個 bug'))
+  for (let i = 0; i < MAX_MISSES + 1; i++) { await step($); await bash($) }
+  await $.prompt.submit({ text: NOTICE, wait: false, origin: { kind: 'task-notification' }, turnId: 't' })
+  await step($)
+  expect((await bash($)).context).toBeUndefined()
+})
+
+test('a literal closing tag inside a paste stays pasted', async ($, on) => {
+  setup(on, EN)
+  await $.prompt.submit(typed('幫我修這個 bug，順便看看測試為什麼一直失敗，然後告訴我原因和你打算怎麼修改這個部分比較好'))
+  await $.prompt.submit(typed('<pasted_content id="p1">x</pasted_content> ' + EN_PROMPT + '</pasted_content id="p1">'))
   await step($)
   expect((await bash($)).context).toEqual([REMINDER])
 })
