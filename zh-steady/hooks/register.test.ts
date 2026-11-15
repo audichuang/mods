@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { REMINDER, isEnglish } from './register'
+import { MAX_MISSES, REMINDER, isEnglish } from './register'
 
 const EN = 'Now I will run the build and check whether the tests still pass on this branch before moving on.'
 const ZH = '接下來我會先跑建置，再確認這個分支上的測試是否都還通過，然後才繼續下一步的修改工作，這樣比較保險。'
@@ -252,4 +252,65 @@ test('isEnglish: 200 KB without spaces finishes fast', () => {
     isEnglish(blob)
     expect(Date.now() - t0).toBeLessThan(500)
   }
+})
+
+// Pasted English is material, not the person choosing English.
+
+const paste = (t: string) => `<pasted_content id="p1">${t}</pasted_content id="p1">`
+
+test('a prompt that is only an English paste keeps the reminder on', async ($, on) => {
+  setup(on, EN)
+  await $.prompt.submit(typed('幫我修這個 bug，順便看看測試為什麼一直失敗，然後告訴我原因和你打算怎麼修改這個部分比較好'))
+  await $.prompt.submit(typed(paste(EN_PROMPT + ' ' + EN_PROMPT)))
+  await step($)
+  expect((await bash($)).context).toEqual([REMINDER])
+})
+
+test('a short Chinese line around an English paste keeps the reminder on', async ($, on) => {
+  setup(on, EN)
+  await $.prompt.submit(typed('看這個 log：' + paste(EN_PROMPT + ' ' + EN_PROMPT)))
+  await step($)
+  expect((await bash($)).context).toEqual([REMINDER])
+})
+
+test('isEnglish: URLs of any scheme do not count', () => {
+  expect(isEnglish('codex://threads/someVeryLongThreadIdentifierWithManyEnglishLettersInIt')).toBeUndefined()
+  expect(isEnglish('看 vscode://file/aaaa，' + ZH)).toBe(false)
+})
+
+// Reminders the model keeps ignoring stop after MAX_MISSES in a row.
+
+test('ignored reminders stop after MAX_MISSES, a Chinese step resets', async ($, on) => {
+  setup(on, ...Array(MAX_MISSES + 2).fill(EN), ZH, EN)
+  await $.prompt.submit(typed('幫我修這個 bug'))
+  const got: (string[] | undefined)[] = []
+  for (let i = 0; i < MAX_MISSES + 2; i++) {
+    await step($)
+    got.push((await bash($)).context)
+  }
+  // First reminder plus MAX_MISSES - 1 repeats, then silence.
+  expect(got.filter(c => c !== undefined).length).toBe(MAX_MISSES)
+  expect(got[MAX_MISSES]).toBeUndefined()
+  await step($) // Chinese
+  await step($) // English again
+  expect((await bash($)).context).toEqual([REMINDER])
+})
+
+test('a reminder that works every time keeps working', async ($, on) => {
+  setup(on, EN, ZH, EN, ZH, EN, ZH, EN)
+  await $.prompt.submit(typed('幫我修這個 bug'))
+  for (let i = 0; i < 4; i++) {
+    await step($)
+    expect((await bash($)).context).toEqual([REMINDER])
+    await step($)
+  }
+})
+
+test('a new prompt resets the miss count', async ($, on) => {
+  setup(on, EN)
+  await $.prompt.submit(typed('幫我修這個 bug'))
+  for (let i = 0; i < MAX_MISSES + 1; i++) { await step($); await bash($) }
+  await $.prompt.submit(typed('繼續'))
+  await step($)
+  expect((await bash($)).context).toEqual([REMINDER])
 })
