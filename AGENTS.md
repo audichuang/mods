@@ -18,13 +18,13 @@
 - 型別檢查用 repo 裡的 `ci/types/claude-code.d.ts`（`.claude-plugin/types/` 只有 engine 載入時才寫、而且 gitignore，CI 拿不到）。升 Claude Code 後跑 `scripts/sync-types.sh` 同步型別檔和 `ci/claude-version`。`ci/tsc-baseline` 記某個 mod 還沒清掉的舊錯數（目前全清，檔案是空的）：只准變少，修掉就把數字改小。
 - 新增 mod：資料夾裡有 `.claude-plugin/plugin.json` 就會被 check.sh 撿到，`hooks/hooks.json` 有 `modules` 就當 mod 跑 test 和 tsc；`plugin.json` 要有 `author`，不然 `--strict` 不過。
 - 測試環境沒有 `setTimeout`。要測計時器的多個週期用 `claude-code/testing` 的 `mock.clock(on)` 再 `advance`；只測啟動時那次，就自己 `on('clock.every', …)` 回 `{ deny }`。
-- `gh-quota`：改 `gh-quota-guard.py` 前先在 `hooktest.sh` 加案例（可寫 `DENY:<理由片段>` 斷言理由）；改 `bin/gh-wait` 前先在 `gh-wait-test.sh` 加案例；改 `bin/gh-trace`／`gh-trace-shim.sh` 前先在 `gh-trace-test.sh` 加案例（測試不碰真的 brew 與家目錄）。
-- `gh-quota-guard.py` 是擋 agent 順手寫出的輪詢，不是安全邊界：審查找到刻意構造的繞過（多層 `bash -c`、跳脫空格、單引號裡的字面 `$i`）歸 Noted，不再加解析層；用 regex 解析 shell 每補一處就多一處邊界，批次判斷別退回「認出重導向再刪掉」的做法。
+- `gh-quota`：改 `gh-quota-guard.py` 前先在 `hooktest.sh` 加案例（可寫 `DENY:<理由片段>` 斷言理由）；改 `bin/gh-wait` 前先在 `gh-wait-test.sh` 加案例；改 `bin/gh-trace`／`gh-trace-shim.sh` 前先在 `gh-trace-test.sh` 加案例（測試不碰真的 brew 與家目錄，PATH 只放暫存目錄：CI runner 的 `/usr/bin` 有真的 gh）。gh-wait／gh-trace 行為有變，合併前對真的 GitHub 跑一次唯讀實測（已完成的 PR、commit、失敗的 run）：假 gh 測不出 `gh api` 拒印含控制碼的 log、真實 job log 尾巴是收尾雜訊這類事。
+- `gh-quota-guard.py` 是擋 agent 順手寫出的輪詢，不是安全邊界：審查找到刻意構造的繞過（多層 `bash -c`、跳脫空格、單引號裡的字面 `$i`）歸 Noted，不再加解析層；用 regex 解析 shell 每補一處就多一處邊界，批次判斷別退回「認出重導向再刪掉」的做法。看到漏擋或新的輪詢寫法，先用 harvest 查對話紀錄裡是否真的出現、agent 為什麼這樣寫：多半是 gh-wait 做不到它要等的東西，優先補 gh-wait 能力與擋下時給的可照抄指令，不先加 hook 解析。
 - 實際互動 session 驗 mod：這台沒有 tmux，用 `(sleep 60 | script -q /dev/null claude >out 2>&1 &)`，在**已信任**的資料夾開（`~/mods` 尚未信任會卡在信任提示），看 log 或去掉 ANSI 後 grep 輸出。這只證明文字有畫出來，看不出位置；改版面要請使用者截圖確認。
 
 ## 發版與部署
 
-1. 行為有變就調 `plugin.json` 的 `version`（只加測試不用）。
+1. 行為有變就把 `plugin.json` 的 `version` 修訂號加一（0.2.6 → 0.2.7），新增功能也一樣，不自己跳次版號（只加測試不用調）。
 2. commit 訊息用繁體中文，格式 `<plugin> <版本>：<改了什麼>`，push 到 `main`。
 3. 三台：`git -C ~/mods pull -q --ff-only && claude plugin update <name>@audi-mods`；新增 plugin 用 `claude plugin install <name>@audi-mods`。開著的 session 要 `/reload-plugins`。upall 也會 pull。
 
