@@ -24,10 +24,15 @@ gh-wait --ignore 'windows-*'           # 已知會掛或卡住的 check 不算�
 gh-wait run <run-id> -R owner/repo     # 等一個 workflow run
 gh-wait pr <number> -R owner/repo      # 等 PR head commit 的所有 checks
 gh-wait commit <sha> -R owner/repo     # 等一個 commit 的所有 checks（run 還沒建出來也會等；短 sha 可以）
+gh-wait tag <tag> -R owner/repo --workflow release.yml   # 等 tag push 觸發的 release run
 ```
 
+推的不是目前 HEAD 時（`git push <remote> <sha>:refs/heads/main <tag>`、`gh pr merge` 在 GitHub 上合併、從另一個 checkout 推），不帶參數會因為「HEAD is not pushed」結束：改用上面這幾行，指名剛推的 commit、tag 或 run。
+
 - 不帶參數時，它從 push 的 remote 判斷 repo：先找 push repo 上這個分支的 open PR，fork 上沒有就去上游（parent）找；HEAD 還沒 push 會直接結束（結束碼 2），請先 push。只認 github.com 的 remote（SSH 別名用本機 `ssh -G` 確認），其他 remote 退回 `gh repo view`。stderr 第一行寫它選了哪個目標。
-- tag push 觸發的 release 一定要加 `--workflow <檔名>`：不帶的話，main 那次 push 的 CI 已經全綠、release 的 run 還沒建出來時會直接回 0。
+- tag push 觸發的 release 一定要加 `--workflow <檔名>`：不帶的話，main 那次 push 的 CI 已經全綠、release 的 run 還沒建出來時會直接回 0。tag 不是目前 HEAD 時用 `gh-wait tag <tag> --workflow <檔名>`：它只追這個 tag push 開的 run，同一個 commit 先前 branch push 跑的同一支 workflow 不算。
+- `commit`／`tag` 沒帶 `-R` 時，用「remote-tracking ref 含有這個 commit 的 remote」決定 repo（只有一個時）；判斷不出來才退回 `gh repo view`。fork 的 checkout 裡 `gh repo view` 常是上游，而上游對 fork 的 commit 會回 200、0 個 check，以前會一路等到逾時。stderr 第一行都會寫 `on owner/repo`，看到不對就停掉改帶 `-R`。
+- 等了 10 分鐘（`GH_WAIT_NOCHECKS`）這個 commit 都沒有任何 check、也沒有排隊中的 Actions suite（或 `--workflow` 一直沒有 run），就回 2 並提示帶 `-R`：通常是等錯 repo。
 - 跑的時候狀態有變化就印一行進度（run 與 `--workflow` 是 `jobs 3/7 done, running: …`，pr／commit 是 `wait:N running (…)`）；結束時印 run 或失敗 check 的 URL，失敗時附上最多 3 個失敗 job 的 log 尾巴（`--log-lines N`，預設 40，0 關掉）。不用另外抓 log 或查 jobs。
 - `--ignore <glob>` 可重複：符合的 check 不等、失敗也不算。非忽略的都完成、只剩被忽略的還在跑時，再等 30 秒（`GH_WAIT_GRACE`）看有沒有新 check 出現，沒有就收工。
 - `--workflow` 會等所有符合的 run（同一個 commit 可能同時有 push 與 pull_request 兩個 run），全部成功才回 0；第一個跑完後會再列一次，之後才出現的 run 不追。

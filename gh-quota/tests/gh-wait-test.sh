@@ -1137,6 +1137,85 @@ resp 2 '200 OK' "$RUN_OK"
 gw 20 run 7 -R o/r -i 1
 check "network error: shown, retried" 0 'stderr-has=error connecting to api.github.com' stdout-has=ok calls=3
 
+# FK: a fork checkout whose `gh repo view` default is the upstream (2026-11-17 incident:
+# `gh-wait commit <fork sha>` waited 62 min on the upstream, which answers 200 with no check runs).
+FK=$T/forkcheckout
+git -C "$T" init -q -b develop "$FK"
+git -C "$FK" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
+git -C "$FK" remote add origin https://github.com/base/project.git
+git -C "$FK" remote add fork https://github.com/me/project.git
+git -C "$FK" update-ref refs/remotes/origin/main HEAD
+git -C "$FK" -c user.name=t -c user.email=t@t commit -q --allow-empty -m forkonly
+FK_SHA=$(git -C "$FK" rev-parse HEAD)
+git -C "$FK" update-ref refs/remotes/fork/develop HEAD
+git -C "$FK" reset -q --hard HEAD~1
+fresh
+resp 1 '200 OK' "$RUNS_OK"
+resp 2 '200 OK' "$SUITES_DONE"
+gw 20 commit "$FK_SHA" -C "$FK" -i 1
+check "FK: commit without -R picks the remote that has the commit" 0 \
+    "argv-has=repos/me/project/commits/$FK_SHA/check-runs" argv-lacks='repo view' \
+    'stderr-has=on me/project' calls=2
+
+FK_BASE=$(git -C "$FK" rev-parse refs/remotes/origin/main)
+git -C "$FK" update-ref refs/remotes/fork/main "$FK_BASE"
+fresh
+echo base/project > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+gw 20 commit "$FK_BASE" -C "$FK" -i 1
+check "FK: a commit on several remotes falls back to gh repo view" 0 \
+    'argv-has=repo view' "argv-has=repos/base/project/commits/$FK_BASE/check-runs" \
+    'stderr-has=on base/project' calls=3
+
+fresh
+resp 1 '200 OK' "$RUNS_OK"
+resp 2 '200 OK' "$SUITES_DONE"
+gw 20 commit "$CHECK_SHA" -R o/r -i 1
+check "FK: the start line names the repo" 0 'stderr-has=commit abc1230 on o/r'
+
+# NC: no check runs and no Actions suite for GH_WAIT_NOCHECKS minutes is a wrong repo, not a slow CI.
+THIRD_PARTY='{"check_suites":[{"app":{"slug":"vercel","name":"Vercel"},"status":"queued","latest_check_runs_count":0}]}'
+SUITES_QUEUED='{"check_suites":[{"app":{"slug":"github-actions","name":"GitHub Actions"},"status":"queued","latest_check_runs_count":0}]}'
+fresh
+resp 1 '200 OK' '{"check_runs":[]}'
+resp 2 '200 OK' "$THIRD_PARTY"
+GH_WAIT_NOCHECKS=0 gw 20 commit "$CHECK_SHA" -R o/r -i 1
+check "NC: no checks and no Actions suite stops with a hint" 2 \
+    'stderr-has=no checks on o/r' 'stderr-has=-R owner/repo' calls=2
+
+fresh
+resp 1 '200 OK' '{"check_runs":[]}'
+resp 2 '200 OK' "$SUITES_QUEUED"
+resp 3 '200 OK' "$RUNS_OK"
+resp 4 '200 OK' "$SUITES_DONE"
+GH_WAIT_NOCHECKS=0 gw 20 commit "$CHECK_SHA" -R o/r -i 1
+check "NC: a queued Actions suite keeps waiting" 0 stdout-has=ok calls=4
+
+fresh
+resp 1 '200 OK' '{"workflow_runs":[]}'
+GH_WAIT_NOCHECKS=0 gw 20 commit "$CHECK_SHA" -R o/r --workflow ci.yml -i 1
+check "NC: no workflow runs either stops with a hint" 2 'stderr-has=no runs of ci.yml on o/r' calls=1
+
+# TG: a tag's workflow wait follows only the tag's runs (the same commit's branch push ran it too).
+TAGRUNS='{"workflow_runs":[{"id":111,"event":"push","head_branch":"develop"},{"id":222,"event":"push","head_branch":"v1.2.3"}]}'
+fresh
+resp 1 '200 OK' "{\"sha\":\"$FULL_SHA\"}"
+resp 2 '200 OK' "$TAGRUNS"
+resp 3 '200 OK' "$RUN_OK"
+resp 4 '200 OK' "$TAGRUNS"
+gw 20 tag v1.2.3 -R o/r --workflow release.yml -i 1
+check "TG: tag mode follows the tag's run only" 0 stdout-has=actions/runs/222 stdout-lacks=actions/runs/111 \
+    'argv-has=repos/o/r/commits/v1.2.3' 'argv-has=branch=v1.2.3' "argv-has=head_sha=$FULL_SHA"
+
+# HP: an unpushed HEAD names what to run for something pushed by refspec or tag.
+git -C "$A" -c user.name=t -c user.email=t@t commit -q --allow-empty -m unpushed-again
+fresh
+gw 20 -C "$A" --workflow release.yml -i 1
+check "HP: unpushed HEAD hint names commit/tag/run with the repo" 2 'stderr-has=push first' \
+    'stderr-has=gh-wait commit <sha> -R o/r --workflow release.yml' 'stderr-has=gh-wait tag <tag> -R o/r' \
+    'stderr-has=gh-wait run <run-id> -R o/r' calls=0
+
 fresh
 resp 1 '502 Bad Gateway' '{"message":"Server Error"}'
 echo 'gh: Server Error (HTTP 502)' > "$S/1.err"; echo 1 > "$S/1.rc"
