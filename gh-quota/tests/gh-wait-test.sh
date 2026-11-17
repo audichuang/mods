@@ -1250,12 +1250,17 @@ check "FK: a non-GitHub push URL falls back to gh repo view" 0 'argv-has=repo vi
     'stderr-has=on base/project (from gh repo view)' calls=3
 git -C "$PF" remote set-url --push fork https://github.com/me/project.git
 
-# The remote that has the commit still wins over the push remote.
+# The remote that has the commit wins over a usable push remote that points at another GitHub repo.
+git -C "$FK" remote add other https://github.com/other/x.git
+git -C "$FK" config remote.pushDefault other
 fresh
 resp 1 '200 OK' "$RUNS_OK"
 resp 2 '200 OK' "$SUITES_DONE"
 gw 20 commit "$FK_SHA" -C "$FK" -i 1
-check "FK: the remote that has the commit is labelled" 0 'stderr-has=on me/project (from remote fork)'
+check "FK: the remote that has the commit beats the push remote" 0 'stderr-has=on me/project (from remote fork)' \
+    stderr-lacks=other/x argv-lacks=repos/other/x argv-lacks='repo view' calls=2
+git -C "$FK" config --unset remote.pushDefault
+git -C "$FK" remote remove other
 
 # The start line names the repo before the first API call: a failed lookup must still show it.
 fresh
