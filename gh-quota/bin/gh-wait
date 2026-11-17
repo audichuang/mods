@@ -17,13 +17,17 @@
 # branch, pushed to the PR's head repo, whose HEAD is pushed (HEAD = @{push} or @{upstream})
 # waits for HEAD the same way.
 # commit waits the same way for one commit's checks (a push with no PR, such as to main),
-# including while its workflows have not started yet. Without -R, commit and tag use the
-# repo of the only remote whose tracking refs contain the commit (a fork checkout's
-# `gh repo view` is often the upstream), else `gh repo view`. The start line names the repo.
-# tag is commit for the commit a tag points to; with --workflow it follows only the runs the
-# tag push started (head_branch = the tag), not a branch push of the same commit.
-# No check runs and no queued Actions suite for GH_WAIT_NOCHECKS minutes (default 10), or
-# no run of --workflow for that long, exits 2: the commit's CI runs in another repo.
+# including while its workflows have not started yet. Without -R, commit and tag pick the repo
+# in this order (a fork checkout's `gh repo view` is often the upstream): the only remote whose
+# tracking refs contain the commit; the push remote (branch pushRemote, remote.pushDefault, branch
+# remote; a detached HEAD only has remote.pushDefault) when it is a GitHub repo; `gh repo view`.
+# The start line names the repo and where it came from, before the first API request (so does
+# an explicit pr's).
+# tag is commit for the commit a tag points to and requires --workflow: it follows only the runs the
+# tag push started (head_branch = the tag), not a branch push of the same commit, whose green CI
+# would otherwise end the wait before the tag's workflow exists.
+# No check runs and no queued or running Actions suite for GH_WAIT_NOCHECKS minutes (default 10),
+# or no run of --workflow for that long, exits 2: the commit's CI runs in another repo.
 #
 # Exit: 0 success, 1 finished but failed, 2 usage/API error or timeout (default 120 min).
 # --workflow file-or-name waits for that workflow on the target SHA to appear,
@@ -71,6 +75,10 @@ done
 [[ $log_lines =~ ^(0|[1-9][0-9]*)$ ]] || usage
 [ -z "$want" ] || [ "$kind" = pr ] || usage
 [ -z "$workflow" ] || [ "$kind" != run ] || usage
+if [ "$kind" = tag ] && [ -z "$workflow" ]; then
+    echo 'gh-wait: tag needs --workflow <file>: without it the green CI of the same commit pushed earlier to a branch ends the wait before the tag workflow runs.' >&2
+    usage
+fi
 command -v jq >/dev/null || { echo 'gh-wait: jq is required (brew install jq / apt install jq)' >&2; exit 2; }
 
 errf=$(mktemp) || exit 2
@@ -181,8 +189,8 @@ pushed_head() {
     [ "$head" = "$up" ] && echo "$head"
 }
 
-repo_explicit=0
-[ -z "$repo" ] || repo_explicit=1
+repo_explicit=0 repo_from=''
+[ -z "$repo" ] || { repo_explicit=1 repo_from='-R'; }
 if [ "$kind" = auto ]; then
     local_head=$(g rev-parse -q --verify HEAD 2>/dev/null) || { echo 'gh-wait: auto mode needs a git checkout with HEAD' >&2; exit 2; }
     branch=$(g symbolic-ref -q --short HEAD 2>/dev/null || :)
@@ -198,7 +206,7 @@ if [ "$kind" = auto ]; then
                 echo "gh-wait: HEAD ${local_head:0:7} is not pushed; push first."
                 echo "To wait for something else you pushed (a refspec push, a tag, a merge made on GitHub), name it:"
                 echo "  gh-wait commit <sha> -R $hint_repo${workflow:+ --workflow $workflow}"
-                echo "  gh-wait tag <tag> -R $hint_repo${workflow:+ --workflow $workflow}"
+                echo "  gh-wait tag <tag> -R $hint_repo --workflow ${workflow:-<workflow-file>}"
                 echo "  gh-wait run <run-id> -R $hint_repo"
             } >&2
             exit 2
@@ -207,22 +215,43 @@ if [ "$kind" = auto ]; then
         branch=${push_ref#refs/remotes/}; branch=${branch#*/}
     fi
 fi
-# commit_remote_repo <commit-ish>: the GitHub repo of the remotes whose tracking refs contain it,
-# when that is exactly one repo.
+# commit_remote_repo <commit-ish>: sets $found_repo and $found_remote to the GitHub repo of the remotes
+# whose tracking refs contain it, when that is exactly one repo (and one of its remotes).
 commit_remote_repo() {
-    local remotes r found=''
+    local remotes r name found=''
+    found_repo='' found_remote=''
     remotes=$(g for-each-ref --contains "$1" --format='%(refname:lstrip=2)' refs/remotes 2>/dev/null) || return 1
     while IFS= read -r r; do
         [ -n "$r" ] || continue
-        r=$(remote_repo "${r%%/*}" fetch) || continue
+        name=${r%%/*}
+        r=$(remote_repo "$name" fetch) || continue
         case " $found " in *" $r "*) ;; *) found="${found:+$found }$r" ;; esac
+        [ -n "$found_remote" ] || found_remote=$name
     done <<<"$remotes"
-    [ -n "$found" ] && [ "${found// /}" = "$found" ] && echo "$found"
+    [ -n "$found" ] && [ "${found// /}" = "$found" ] || return 1
+    found_repo=$found
+}
+# push_remote_repo: the GitHub repo that this checkout pushes to; sets $found_remote to the remote.
+# A DISABLED or non-GitHub push URL gives no repo.
+push_remote_repo() {
+    local branch remote
+    branch=$(g symbolic-ref -q --short HEAD 2>/dev/null || :)
+    if [ -n "$branch" ]; then remote=$(push_remote "$branch" || :); else remote=$(g config remote.pushDefault || :); fi
+    [ -n "$remote" ] || return 1
+    found_repo=$(remote_repo "$remote") || return 1
+    found_remote=$remote
 }
 if [ -z "$repo" ] && { [ "$kind" = commit ] || [ "$kind" = tag ]; }; then
-    repo=$(commit_remote_repo "$target" || :)
+    if commit_remote_repo "$target"; then
+        repo=$found_repo repo_from="remote $found_remote"
+    elif push_remote_repo; then
+        repo=$found_repo repo_from="push remote $found_remote"
+    fi
 fi
-[ -n "$repo" ] || repo=$(cd -- "$dir" && gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
+if [ -z "$repo" ]; then
+    repo=$(cd -- "$dir" && gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
+    repo_from='gh repo view'
+fi
 if [ "$kind" = auto ]; then
     target='' reason='detached HEAD' commit_repo=$repo
     if [ -n "$branch" ]; then
@@ -266,6 +295,7 @@ case $kind in
         jq_state='if .status == "completed" then (if .conclusion == "success" then "ok" else "fail:" + .conclusion end) else "wait:" + .status end'
         ;;
     pr)
+        [ "$auto_guess" = 1 ] || echo "gh-wait: PR #$target on $repo (from $repo_from)" >&2
         head_read
         # A guessed HEAD can be wrong (the PR already moved past it), so its wait is bounded;
         # GitHub catches up with a push within seconds. An explicit --sha waits to the deadline.
@@ -291,6 +321,11 @@ case $kind in
         fi
         ;;
     commit|tag)
+        # The repo goes out before any request: a wrong repo shows up as a 422 on the lookup below.
+        if [ "$auto_guess" = 0 ] && [ -z "${reason:-}" ]; then
+            if [ "$kind" = tag ]; then echo "gh-wait: tag $target on $repo (from $repo_from)" >&2
+            else echo "gh-wait: commit ${target:0:7} on $repo (from $repo_from)" >&2; fi
+        fi
         if [[ $target =~ ^[0-9a-fA-F]{40}$ ]]; then
             sha=$target
         else
@@ -298,10 +333,7 @@ case $kind in
             read_api "repos/$repo/commits/$query" 'commit'
             sha=$(jq -er '.sha // empty' <<<"$body") || exit 2
         fi
-        if [ "$auto_guess" = 0 ] && [ -z "${reason:-}" ]; then
-            if [ "$kind" = tag ]; then echo "gh-wait: tag $target (${sha:0:7}) on $repo" >&2
-            else echo "gh-wait: commit ${target:0:7} on $repo" >&2; fi
-        fi
+        if [ "$kind" = tag ]; then echo "gh-wait: tag $target is commit ${sha:0:7}" >&2; fi
         ;;
     *) usage ;;
 esac
@@ -601,10 +633,10 @@ read_jobs() {
 }
 run_snapshot='' jobs='[]' jobs_valid=0 last_jobs=''
 
-# actions_pending: the commit has an Actions check suite (a workflow queued or running).
+# actions_pending: the commit has an unfinished Actions check suite (a workflow queued or running).
 actions_pending() {
     read_api "repos/$repo/commits/$sha/check-suites?per_page=100" 'check suites'
-    jq -e 'any(.check_suites[]?; .app.slug == "github-actions" or .app.name == "GitHub Actions")' <<<"$body" >/dev/null
+    jq -e 'any(.check_suites[]?; .status != "completed" and (.app.slug == "github-actions" or .app.name == "GitHub Actions"))' <<<"$body" >/dev/null
 }
 nochecks_limit=$(( ${GH_WAIT_NOCHECKS:-10} * ${GH_WAIT_MINUTE:-60} )) nochecks_since=$SECONDS
 etag='' last='' errors=0 suite_errors=0 changed=$SECONDS beat=$SECONDS

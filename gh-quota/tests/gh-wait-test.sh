@@ -929,6 +929,18 @@ check "pr: no checks, running, ok" 0 'stdout-has=wait:no checks yet' 'stdout-has
     argv-has=repos/o/r/pulls/5 argv-has=repos/o/r/commits/abc123/check-runs 'argv-has=If-None-Match: "e1"' \
     argv-has=repos/o/r/commits/abc123/check-suites calls=5
 
+fresh
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":""}}'
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+gw 20 pr 5 -R o/r -i 1
+check "pr: the start line names the repo" 0 'stderr-has=gh-wait: PR #5 on o/r (from -R)'
+fresh
+resp 1 '404 Not Found' '{"message":"Not Found"}'
+echo 'gh: Not Found (HTTP 404)' > "$S/1.err"; echo 1 > "$S/1.rc"
+gw 20 pr 5 -R o/r -i 1
+check "pr: the start line is printed before a failed PR read" 2 'stderr-has=PR #5 on o/r' 'stderr-has=HTTP 404' calls=1
+
 # A job with needs: has no check run until the jobs it needs finish, so every existing run can be
 # green while its workflow (check suite) is still in progress.
 fresh
@@ -1173,6 +1185,95 @@ resp 1 '200 OK' "$RUNS_OK"
 resp 2 '200 OK' "$SUITES_DONE"
 gw 20 commit "$CHECK_SHA" -R o/r -i 1
 check "FK: the start line names the repo" 0 'stderr-has=commit abc1230 on o/r'
+check "FK: -R is labelled as the source" 0 'stderr-has=commit abc1230 on o/r (from -R)'
+
+# FK: a commit that no remote-tracking ref contains (the fork's branch was rewritten) falls back to the
+# push remote before `gh repo view`, which in a fork checkout is the upstream (2026-11-17: openidea).
+PF=$T/pushcheckout
+git -C "$T" init -q -b develop "$PF"
+git -C "$PF" -c user.name=t -c user.email=t@t commit -q --allow-empty -m lost
+PF_SHA=$(git -C "$PF" rev-parse HEAD)
+git -C "$PF" remote add origin https://github.com/base/project.git
+git -C "$PF" remote add fork https://github.com/me/project.git
+git -C "$PF" remote set-url --push origin DISABLED
+git -C "$PF" config remote.pushDefault fork
+fresh
+resp 1 '200 OK' "$RUNS_OK"
+resp 2 '200 OK' "$SUITES_DONE"
+gw 20 commit "$PF_SHA" -C "$PF" -i 1
+check "FK: no remote has the commit, the push remote is used before gh repo view" 0 \
+    "argv-has=repos/me/project/commits/$PF_SHA/check-runs" argv-lacks='repo view' \
+    'stderr-has=on me/project (from push remote fork)' calls=2
+
+git -C "$PF" config --unset remote.pushDefault
+git -C "$PF" config branch.develop.pushRemote fork
+fresh
+resp 1 '200 OK' "$RUNS_OK"
+resp 2 '200 OK' "$SUITES_DONE"
+gw 20 commit "$PF_SHA" -C "$PF" -i 1
+check "FK: branch pushRemote counts as the push remote" 0 \
+    'stderr-has=on me/project (from push remote fork)' argv-lacks='repo view' calls=2
+
+# A detached HEAD has no branch pushRemote, only remote.pushDefault.
+git -C "$PF" checkout -q --detach
+fresh
+echo base/project > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+gw 20 commit "$PF_SHA" -C "$PF" -i 1
+check "FK: detached HEAD ignores the branch settings; no pushDefault goes to gh repo view" 0 \
+    'argv-has=repo view' 'stderr-lacks=push remote' 'stderr-has=(from gh repo view)'
+git -C "$PF" config remote.pushDefault fork
+fresh
+resp 1 '200 OK' "$RUNS_OK"
+resp 2 '200 OK' "$SUITES_DONE"
+gw 20 commit "$PF_SHA" -C "$PF" -i 1
+check "FK: detached HEAD uses remote.pushDefault" 0 'stderr-has=on me/project (from push remote fork)' argv-lacks='repo view'
+git -C "$PF" checkout -q develop
+
+# A DISABLED or non-GitHub push URL is not a repo: next level, gh repo view, still labelled.
+git -C "$PF" remote set-url --push fork DISABLED
+fresh
+echo base/project > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+gw 20 commit "$PF_SHA" -C "$PF" -i 1
+check "FK: a DISABLED push URL falls back to gh repo view" 0 'argv-has=repo view' \
+    'stderr-has=on base/project (from gh repo view)' calls=3
+git -C "$PF" remote set-url --push fork https://gitlab.com/me/project.git
+fresh
+echo base/project > "$S/1.out"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+gw 20 commit "$PF_SHA" -C "$PF" -i 1
+check "FK: a non-GitHub push URL falls back to gh repo view" 0 'argv-has=repo view' \
+    'stderr-has=on base/project (from gh repo view)' calls=3
+git -C "$PF" remote set-url --push fork https://github.com/me/project.git
+
+# The remote that has the commit still wins over the push remote.
+fresh
+resp 1 '200 OK' "$RUNS_OK"
+resp 2 '200 OK' "$SUITES_DONE"
+gw 20 commit "$FK_SHA" -C "$FK" -i 1
+check "FK: the remote that has the commit is labelled" 0 'stderr-has=on me/project (from remote fork)'
+
+# The start line names the repo before the first API call: a failed lookup must still show it.
+fresh
+resp 1 '422 Unprocessable Entity' '{"message":"No commit found for SHA: abc12"}'
+echo 'gh: No commit found (HTTP 422)' > "$S/1.err"; echo 1 > "$S/1.rc"
+gw 20 commit abc12 -R o/r -i 1
+check "FK: a failed commit lookup still printed the repo" 2 'stderr-has=commit abc12 on o/r' 'stderr-has=HTTP 422' calls=1
+fresh
+resp 1 '422 Unprocessable Entity' '{"message":"No commit found for SHA: v9"}'
+echo 'gh: No commit found (HTTP 422)' > "$S/1.err"; echo 1 > "$S/1.rc"
+gw 20 tag v9 -R o/r --workflow release.yml -i 1
+check "FK: a failed tag lookup still printed the repo" 2 'stderr-has=tag v9 on o/r' 'stderr-has=HTTP 422' calls=1
+fresh
+resp 1 '422 Unprocessable Entity' '{"message":"No commit found for SHA: abc12"}'
+echo 'gh: No commit found (HTTP 422)' > "$S/1.err"; echo 1 > "$S/1.rc"
+gw 20 commit abc12 -C "$PF" -i 1
+check "FK: the push remote repo is printed before a failed lookup" 2 \
+    'stderr-has=on me/project (from push remote fork)' 'stderr-has=HTTP 422' calls=1
 
 # NC: no check runs and no Actions suite for GH_WAIT_NOCHECKS minutes is a wrong repo, not a slow CI.
 THIRD_PARTY='{"check_suites":[{"app":{"slug":"vercel","name":"Vercel"},"status":"queued","latest_check_runs_count":0}]}'
@@ -1192,6 +1293,14 @@ resp 4 '200 OK' "$SUITES_DONE"
 GH_WAIT_NOCHECKS=0 gw 20 commit "$CHECK_SHA" -R o/r -i 1
 check "NC: a queued Actions suite keeps waiting" 0 stdout-has=ok calls=4
 
+# A completed Actions suite with no check runs is not pending: it must not reset the clock forever.
+SUITES_COMPLETED_EMPTY='{"check_suites":[{"app":{"slug":"github-actions","name":"GitHub Actions"},"status":"completed","conclusion":"success","latest_check_runs_count":0}]}'
+fresh
+resp 1 '200 OK' '{"check_runs":[]}'
+resp 2 '200 OK' "$SUITES_COMPLETED_EMPTY"
+GH_WAIT_NOCHECKS=0 gw 8 commit "$CHECK_SHA" -R o/r -i 1
+check "NC: a completed Actions suite with no runs is not pending" 2 'stderr-has=no checks on o/r' calls=2
+
 fresh
 resp 1 '200 OK' '{"workflow_runs":[]}'
 GH_WAIT_NOCHECKS=0 gw 20 commit "$CHECK_SHA" -R o/r --workflow ci.yml -i 1
@@ -1207,6 +1316,14 @@ resp 4 '200 OK' "$TAGRUNS"
 gw 20 tag v1.2.3 -R o/r --workflow release.yml -i 1
 check "TG: tag mode follows the tag's run only" 0 stdout-has=actions/runs/222 stdout-lacks=actions/runs/111 \
     'argv-has=repos/o/r/commits/v1.2.3' 'argv-has=branch=v1.2.3' "argv-has=head_sha=$FULL_SHA"
+
+# Without --workflow a tag would return as soon as the branch push of the same commit is green.
+fresh
+resp 1 '200 OK' "{\"sha\":\"$FULL_SHA\"}"
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+gw 20 tag v1.2.3 -R o/r -i 1
+check "TG: tag without --workflow is a usage error" 2 'stderr-has=--workflow' 'stderr-has=tag' calls=0
 
 # HP: an unpushed HEAD names what to run for something pushed by refspec or tag.
 git -C "$A" -c user.name=t -c user.email=t@t commit -q --allow-empty -m unpushed-again
