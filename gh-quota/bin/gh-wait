@@ -30,6 +30,8 @@
 # or no run of --workflow for that long, exits 2: the commit's CI runs in another repo.
 #
 # Exit: 0 success, 1 finished but failed, 2 usage/API error or timeout (default 120 min).
+# The last stdout line is always `RESULT: success|failure|error <url or target>`: the run's URL,
+# the PR's or commit's checks page (also under --workflow), or `-` before the target is known.
 # --workflow file-or-name waits for that workflow on the target SHA to appear,
 # then follows all matching runs, filtering known branches and PR events. Re-list
 # once after the first completion to include late runs; later arrivals are not tracked.
@@ -51,6 +53,14 @@
 # Needs gh and jq.
 set -uo pipefail
 
+# Only the three real exits set success/failure; any other way out (usage, API error, timeout,
+# a signal) reports error.
+gw_result=error result_url='' errf=''
+on_exit() {
+    [ -z "$errf" ] || rm -f "$errf"
+    echo "RESULT: $gw_result ${result_url:--}"
+}
+trap on_exit EXIT
 usage() { sed -n 's/^#   //p' "$0" >&2; exit 2; }
 kind=auto target='' repo='' interval=15 timeout=120 want='' dir=. workflow='' log_lines=40 ignore_count=0 auto_guess=0 head_etag=''
 ignore_globs=()
@@ -82,7 +92,6 @@ fi
 command -v jq >/dev/null || { echo 'gh-wait: jq is required (brew install jq / apt install jq)' >&2; exit 2; }
 
 errf=$(mktemp) || exit 2
-trap 'rm -f "$errf"' EXIT
 # GH_WAIT_MINUTE (seconds per -t minute) only exists so tests can time out quickly.
 deadline=$((SECONDS + timeout * ${GH_WAIT_MINUTE:-60}))
 
@@ -291,10 +300,12 @@ fi
 case $kind in
     run)
         path="repos/$repo/actions/runs/$target"
+        result_url="https://github.com/$repo/actions/runs/$target"
         # done: completed; ok: conclusion is success
         jq_state='if .status == "completed" then (if .conclusion == "success" then "ok" else "fail:" + .conclusion end) else "wait:" + .status end'
         ;;
     pr)
+        result_url="https://github.com/$repo/pull/$target/checks"
         [ "$auto_guess" = 1 ] || echo "gh-wait: PR #$target on $repo (from $repo_from)" >&2
         head_read
         # A guessed HEAD can be wrong (the PR already moved past it), so its wait is bounded;
@@ -321,6 +332,7 @@ case $kind in
         fi
         ;;
     commit|tag)
+        result_url="https://github.com/$repo/commit/$target/checks"
         # The repo goes out before any request: a wrong repo shows up as a 422 on the lookup below.
         if [ "$auto_guess" = 0 ] && [ -z "${reason:-}" ]; then
             if [ "$kind" = tag ]; then echo "gh-wait: tag $target on $repo (from $repo_from)" >&2
@@ -334,6 +346,7 @@ case $kind in
             sha=$(jq -er '.sha // empty' <<<"$body") || exit 2
         fi
         if [ "$kind" = tag ]; then echo "gh-wait: tag $target is commit ${sha:0:7}" >&2; fi
+        result_url="https://github.com/$repo/commit/$sha/checks"
         ;;
     *) usage ;;
 esac
@@ -408,6 +421,7 @@ workflow_next() {
         .[1] as $done | [.[0][] | select(.run_attempt > ($done[(.id | tostring)].attempt // 0))] | .[0] // empty') || exit 2
     if [ -z "$next" ]; then
         result=$(jq -r 'if any(.[]; .result != 0) then 1 else 0 end' <<<"$workflow_done") || exit 2
+        if [ "$result" = 0 ]; then gw_result=success; else gw_result=failure; fi
         exit "$result"
     fi
     target=$(jq -r '.id' <<<"$next") || exit 2
@@ -715,6 +729,7 @@ while :; do
                 ok)
                     print_urls || exit 2
                     if [ -n "$workflow_path" ]; then workflow_finish 0; continue; fi
+                    gw_result=success
                     exit 0 ;;
 
                 fail:*)
@@ -725,6 +740,7 @@ while :; do
                     fi
                     failure_details
                     if [ -n "$workflow_path" ]; then workflow_finish 1; continue; fi
+                    gw_result=failure
                     exit 1
                     ;;
             esac

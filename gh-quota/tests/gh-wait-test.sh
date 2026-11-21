@@ -114,6 +114,7 @@ check() {
             argv-has=*) grep -qF -- "${c#*=}" "$S/argv" || why="$why; no gh call had '${c#*=}'" ;;
             argv-exact-lacks=*) grep -qxF -- "${c#*=}" "$S/argv" && why="$why; gh called '${c#*=}'" ;;
             argv-lacks=*) grep -qF -- "${c#*=}" "$S/argv" && why="$why; a gh call had '${c#*=}'" ;;
+            last=*) [ "$(tail -n 1 "$T/out")" = "${c#*=}" ] || why="$why; last stdout line is '$(tail -n 1 "$T/out")', want '${c#*=}'" ;;
             calls=*) [ "$(wc -l < "$S/argv" | tr -d ' ')" = "${c#*=}" ] || why="$why; $(wc -l < "$S/argv" | tr -d ' ') gh calls, want ${c#*=}" ;;
         esac
     done
@@ -151,7 +152,7 @@ check "logs: first error excerpt contains failure context and excludes cleanup" 
     'stdout-has=##[error]Process completed with exit code 1.' \
     stdout-lacks=setup-dropped stdout-lacks=cleanup-noise stdout-lacks=cleanup-container \
     stdout-lacks=second-error-must-not-win stdout-lacks=2026-11-15T calls=3
-[ "$(tail -n 1 "$T/out")" = '##[error]Process completed with exit code 1.' ] || {
+[ "$(tail -n 2 "$T/out" | head -n 1)" = '##[error]Process completed with exit code 1.' ] || {
     echo 'FAIL logs: excerpt did not end at the first error'; fail=1;
 }
 
@@ -1371,4 +1372,58 @@ gw 10 job 7 -R o/r
 check "usage: unknown kind" 2 stderr-has=gh-wait
 gw 10 run 7 -R o/r --sha abc
 check "usage: --sha is only for pr" 2 stderr-has=gh-wait
+
+# The last stdout line states the result, whatever the way out.
+fresh
+resp 1 '200 OK' "$RUN_OK"
+gw 10 run 7 -R o/r -i 1
+check "RESULT: run success" 0 'last=RESULT: success https://github.com/o/r/actions/runs/7'
+fresh
+resp 1 '200 OK' '{"status":"completed","conclusion":"failure"}'
+jobs_resp 1 '{"jobs":[{"id":11,"name":"build","status":"completed","conclusion":"failure"}]}'
+echo '##[error]boom' > "$S/log.11.out"
+gw 10 run 7 -R o/r -i 1
+check "RESULT: run failure follows the log excerpt" 1 'stdout-has=##[error]boom' \
+    'last=RESULT: failure https://github.com/o/r/actions/runs/7'
+fresh
+resp 1 '404 Not Found' '{"message":"Not Found"}'
+echo 'gh: Not Found (HTTP 404)' > "$S/1.err"; echo 1 > "$S/1.rc"
+gw 10 run 7 -R o/r -i 1
+check "RESULT: API error" 2 'last=RESULT: error https://github.com/o/r/actions/runs/7'
+fresh
+gw 10 run 7 -R o/r -i 0
+check "RESULT: usage error has no target" 2 'last=RESULT: error -' calls=0
+fresh
+resp 1 '200 OK' "$RUN_WAIT"
+gw 10 run 7 -R o/r -i 1 -t 1
+check "RESULT: timeout" 2 'last=RESULT: error https://github.com/o/r/actions/runs/7'
+fresh
+resp 1 '200 OK' '{"check_runs":[{"name":"build","status":"completed","conclusion":"failure","html_url":"https://ci.example/failed"}]}'
+gw 20 commit "$CHECK_SHA" -R o/r -i 1
+check "RESULT: commit failure names the commit's checks" 1 \
+    "last=RESULT: failure https://github.com/o/r/commit/$CHECK_SHA/checks"
+fresh
+resp 1 '200 OK' '{"head":{"sha":"abc123","ref":"feat"}}'
+resp 2 '200 OK' "$RUNS_OK"
+resp 3 '200 OK' "$SUITES_DONE"
+gw 20 pr 45 -R o/r --sha abc123 -i 1
+check "RESULT: pr success names the PR's checks" 0 'last=RESULT: success https://github.com/o/r/pull/45/checks'
+# Under --workflow the mode switches to run per run; the result still names the commit.
+fresh
+resp 1 '200 OK' '{"workflow_runs":[{"id":77},{"id":78}]}'
+resp 2 '200 OK' '{"status":"completed","conclusion":"failure"}'
+resp 3 '200 OK' '{"workflow_runs":[{"id":77},{"id":78}]}'
+resp 4 '200 OK' "$RUN_OK"
+gw 20 commit "$CHECK_SHA" -R o/r --workflow ci.yml -i 1 --log-lines 0
+check "RESULT: workflow with one failed run of two" 1 \
+    "last=RESULT: failure https://github.com/o/r/commit/$CHECK_SHA/checks"
+# A killed gh-wait never claims success.
+fresh
+resp 1 '200 OK' "$RUN_WAIT"
+gw 2 run 7 -R o/r -i 1
+if [ "$rc" = 0 ] || grep -q 'RESULT: success' "$T/out"; then
+    echo "FAIL RESULT: killed run claims success (rc $rc)"; fail=1
+else
+    echo "ok   RESULT: killed run does not claim success ($(tail -n 1 "$T/out"))"
+fi
 exit $fail

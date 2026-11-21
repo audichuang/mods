@@ -44,6 +44,7 @@ gh-wait tag <tag> -R owner/repo --workflow release.yml   # 等 tag push 觸發�
 - 同一個 commit 重跑過 CI（例如把 PR 先關再開）時，舊那輪失敗的 check suite 還掛在這個 commit 上，`gh-wait pr` 會把它算進去而回報失敗。先查新那輪的 run id,改用 `gh-wait run <新 run id>` 等。
 
 - 結束碼：0 成功、1 失敗（`pr` 印出失敗的 check，`run` 印出失敗的 job）、2 參數錯誤、API 錯誤或逾時（stderr 會寫是哪一種，並附上 gh 自己的錯誤訊息）。
+- stdout 最後一行一定是 `RESULT: success|failure|error <網址>`：`run` 是 run 的網址，`pr` 是 PR 的 checks 頁，`commit`／`tag`（含 `--workflow`）是該 commit 的 checks 頁，還不知道目標時是 `-`。跟結束碼一致（0／1／2），被砍掉也印 `error`，不會印 `success`。讀結果看這行就好，不必另外拿結束碼。
 - 選項：`-i` 輪詢秒數（預設 15）、`-t` 逾時分鐘（預設 120）、`--sha`（只有 `pr`：先等 PR head 變成這個 commit，可給短 sha）、`-C`、`--workflow`、`--ignore`、`--log-lines`（見上）。
 - 需要 `gh` 和 `jq`；沒有 jq 會立刻說明並結束。
 - gh 沒登入會立刻結束（結束碼 2）；網路錯誤或 5xx 會重試，連續 5 次才放棄；額度用完（403／429 且剩 0）會等到重置時間再繼續，不算錯誤（一開始讀 PR head 那次也一樣）。
